@@ -1,16 +1,20 @@
-"""Domain crawler and subdomain enumerator.
+"""Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 domain_crawler.py
+  python3 breach_checker.py
 
-The script prompts for the target domain. API credentials and crawl depth
-are loaded from ``config.json`` if present, falling back to environment
-variables:
+The script prompts for the target domain. API credentials and crawl depth are
+loaded from ``config.json`` if present, falling back to environment variables:
 
   HIBP_API_KEY   - HaveIBeenPwned API key
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
 
-Create ``config.json`` in the same directory with keys ``hibp_api_key`` and ``crawl_depth`` to avoid setting environment variables each run. If the ``katana`` command is available on the system it will be used for deeper crawling with the regex rules from ``field-config.yaml``; its output is scanned for emails and phone numbers as well as additional URLs before pages are processed by this script.
+Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
+``crawl_depth`` to avoid setting environment variables each run. If the
+``katana`` command is available it will be used for deeper crawling with the
+regex rules from ``field-config.yaml``; its output is scanned for emails and
+phone numbers as well as additional URLs before pages are processed by this
+script.
 """
 
 # This script gathers subdomains for a target domain, crawls each host for

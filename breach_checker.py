@@ -18,8 +18,8 @@ script.
 """
 
 # This script gathers subdomains for a target domain, crawls each host for
-# contact information such as emails, usernames and phone numbers, and
-# optionally checks discovered emails against public breach data.
+# contact information such as emails and phone numbers, and optionally checks
+# discovered emails against public breach data.
 
 
 import os
@@ -164,7 +164,6 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 EMAIL_RE = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
-USERNAME_FIELD_RE = re.compile(r"(?:name|id)=[\"']username[\"']\s+value=[\"']([^\"']+)[\"']")
 
 
 class Crawler:
@@ -181,7 +180,6 @@ class Crawler:
         self.visited: Set[str] = set()
         # Containers for discovered data
         self.emails: Set[str] = set()
-        self.usernames: Set[str] = set()
         self.phones: Set[str] = set()
 
     async def crawl(self, start_url: str):
@@ -223,8 +221,6 @@ class Crawler:
         """Pull data of interest out of page text."""
         self.emails.update(EMAIL_RE.findall(text))
         self.phones.update(PHONE_RE.findall(text))
-        for match in USERNAME_FIELD_RE.findall(text):
-            self.usernames.add(match)
 
 
 # ---------------------- Breach checkers ----------------------
@@ -311,7 +307,6 @@ async def main():
                 f.write(item + "\n")
 
     save_set("emails.txt", crawler.emails)
-    save_set("usernames.txt", crawler.usernames)
     save_set("phones.txt", crawler.phones)
     save_set("breached_emails.txt", set(breached_emails.keys()))
 
@@ -319,7 +314,6 @@ async def main():
     print("\n--------- Summary ---------")
     print(f"Emails found: {len(crawler.emails)}")
     print(f"Breached emails: {len(breached_emails)}")
-    print(f"Usernames found: {len(crawler.usernames)}")
     print(f"Phone numbers found: {len(crawler.phones)}")
 
     if breached_emails:
@@ -327,7 +321,7 @@ async def main():
         for email, breaches in breached_emails.items():
             print(f" - {email}: {', '.join(breaches)}")
 
-    print("\nResults saved to emails.txt, breached_emails.txt, usernames.txt, phones.txt")
+    print("\nResults saved to emails.txt, breached_emails.txt, phones.txt")
 
     # ---- end of processing ----
 

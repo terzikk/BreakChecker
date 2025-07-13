@@ -166,8 +166,11 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
 # Regular expressions used during scraping
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
-EMAIL_RE = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
+# The email pattern accepts most common mailbox characters including plus
+# signs. The phone pattern allows optional country code, spaces, dashes and
+# parentheses while requiring at least seven digits overall.
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
 
 
 def normalize_email(email: str) -> str:

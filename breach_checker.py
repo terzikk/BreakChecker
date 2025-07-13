@@ -1,21 +1,26 @@
-"""Domain crawler and subdomain enumerator.
+"""Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 domain_crawler.py
+  python3 breach_checker.py
 
-The script prompts for the target domain. API credentials and crawl depth
-are loaded from ``config.json`` if present, falling back to environment
-variables:
+The script prompts for the target domain. API credentials and crawl depth are
+loaded from ``config.json`` if present, falling back to environment variables:
 
   HIBP_API_KEY   - HaveIBeenPwned API key
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
 
-Create ``config.json`` in the same directory with keys ``hibp_api_key`` and ``crawl_depth`` to avoid setting environment variables each run. If the ``katana`` command is available on the system it will be used for deeper crawling with the regex rules from ``field-config.yaml``; its output is scanned for emails and phone numbers as well as additional URLs before pages are processed by this script.
+Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
+``crawl_depth`` to avoid setting environment variables each run. If the
+``katana`` command is available it will be used for deeper crawling with the
+regex rules from ``field-config.yaml``; its output is scanned for emails and
+phone numbers as well as additional URLs before pages are processed by this
+script.
 """
 
 # This script gathers subdomains for a target domain, crawls each host for
-# contact information such as emails, usernames and phone numbers, and
-# optionally checks discovered emails against public breach data.
+# contact information such as emails and phone numbers, and optionally checks
+# discovered emails against public breach data. All emails and phone numbers
+# are normalized and deduplicated before breach checks and saving to disk.
 
 
 import os
@@ -133,8 +138,12 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         )
         output = result.stdout
         urls.update(URL_RE.findall(output))
-        emails.update(EMAIL_RE.findall(output))
-        phones.update(PHONE_RE.findall(output))
+        for email in EMAIL_RE.findall(output):
+            emails.add(normalize_email(email))
+        for phone in PHONE_RE.findall(output):
+            norm = normalize_phone(phone)
+            if norm:
+                phones.add(norm)
     except Exception:
         pass
 
@@ -160,7 +169,17 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 EMAIL_RE = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
-USERNAME_FIELD_RE = re.compile(r"(?:name|id)=[\"']username[\"']\s+value=[\"']([^\"']+)[\"']")
+
+
+def normalize_email(email: str) -> str:
+    """Return a canonical form of an email address for deduplication."""
+    return email.strip().lower()
+
+
+def normalize_phone(phone: str) -> Optional[str]:
+    """Remove formatting characters from a phone number and validate length."""
+    digits = re.sub(r"\D", "", phone)
+    return digits if len(digits) >= 7 else None
 
 
 class Crawler:
@@ -177,7 +196,6 @@ class Crawler:
         self.visited: Set[str] = set()
         # Containers for discovered data
         self.emails: Set[str] = set()
-        self.usernames: Set[str] = set()
         self.phones: Set[str] = set()
 
     async def crawl(self, start_url: str):
@@ -217,10 +235,12 @@ class Crawler:
 
     def extract_data(self, text: str):
         """Pull data of interest out of page text."""
-        self.emails.update(EMAIL_RE.findall(text))
-        self.phones.update(PHONE_RE.findall(text))
-        for match in USERNAME_FIELD_RE.findall(text):
-            self.usernames.add(match)
+        for email in EMAIL_RE.findall(text):
+            self.emails.add(normalize_email(email))
+        for phone in PHONE_RE.findall(text):
+            norm = normalize_phone(phone)
+            if norm:
+                self.phones.add(norm)
 
 
 # ---------------------- Breach checkers ----------------------
@@ -307,7 +327,6 @@ async def main():
                 f.write(item + "\n")
 
     save_set("emails.txt", crawler.emails)
-    save_set("usernames.txt", crawler.usernames)
     save_set("phones.txt", crawler.phones)
     save_set("breached_emails.txt", set(breached_emails.keys()))
 
@@ -315,7 +334,6 @@ async def main():
     print("\n--------- Summary ---------")
     print(f"Emails found: {len(crawler.emails)}")
     print(f"Breached emails: {len(breached_emails)}")
-    print(f"Usernames found: {len(crawler.usernames)}")
     print(f"Phone numbers found: {len(crawler.phones)}")
 
     if breached_emails:
@@ -323,7 +341,7 @@ async def main():
         for email, breaches in breached_emails.items():
             print(f" - {email}: {', '.join(breaches)}")
 
-    print("\nResults saved to emails.txt, breached_emails.txt, usernames.txt, phones.txt")
+    print("\nResults saved to emails.txt, breached_emails.txt, phones.txt")
 
     # ---- end of processing ----
 

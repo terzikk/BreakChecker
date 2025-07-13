@@ -61,7 +61,11 @@ def load_config() -> dict:
     return config
 
 def enumerate_subdomains(domain: str) -> Set[str]:
-    """Enumerate subdomains using subfinder if available or crt.sh fallback."""
+    """Enumerate subdomains using subfinder if available or crt.sh fallback.
+
+    Wildcard entries like ``*.example.com`` are stripped of the ``*`` to avoid
+    invalid hostnames being crawled.
+    """
     subs = set()
     # Try the "subfinder" tool first as it is fast and comprehensive
     if shutil.which("subfinder"):
@@ -86,8 +90,10 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                 for entry in data:
                     name_value = entry.get("name_value", "")
                     for sub in name_value.split("\n"):
-                        sub = sub.strip()
-                        if sub.endswith(domain):
+                        sub = sub.strip().lower()
+                        if '*' in sub:
+                            sub = sub.lstrip('*.')
+                        if sub and sub.endswith(domain):
                             subs.add(sub)
         except Exception:
             # Any network/JSON error simply results in returning the main domain

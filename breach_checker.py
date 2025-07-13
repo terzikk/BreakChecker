@@ -20,8 +20,8 @@ script.
 # This script gathers subdomains for a target domain, crawls each host for
 # contact information such as emails and phone numbers, and optionally checks
 # discovered emails against public breach data. Emails are deduplicated
-# case-insensitively but saved exactly as found. Phone numbers are normalized
-# only for deduplication; the original values are written to disk.
+# case-insensitively but saved exactly as found. Phone numbers are validated
+# and stored in a uniform digits-only format for easier processing.
 
 
 import os
@@ -176,9 +176,11 @@ def normalize_email(email: str) -> str:
 
 
 def normalize_phone(phone: str) -> Optional[str]:
-    """Remove formatting characters from a phone number and validate length."""
+    """Return a digits-only phone number if it appears valid."""
     digits = re.sub(r"\D", "", phone)
-    return digits if len(digits) >= 7 else None
+    if 7 <= len(digits) <= 15:
+        return digits
+    return None
 
 
 class Crawler:
@@ -204,10 +206,10 @@ class Crawler:
             self.emails[canon] = email.strip()
 
     def add_phone(self, phone: str) -> None:
-        """Store phone if valid and not already seen."""
+        """Store phone in digits-only form if valid and not already seen."""
         norm = normalize_phone(phone)
         if norm and norm not in self.phones:
-            self.phones[norm] = phone.strip()
+            self.phones[norm] = norm
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""

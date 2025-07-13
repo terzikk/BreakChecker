@@ -237,11 +237,12 @@ class Crawler:
         soup = BeautifulSoup(content, "html.parser")
         # also search the rendered text for emails split by HTML tags
         self.extract_data(soup.get_text(" "))
-        # capture mailto: links explicitly
+        # capture mailto: links explicitly (case-insensitive)
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if href.startswith("mailto:"):
-                self.add_email(href[7:].split("?")[0])
+            if href.lower().startswith("mailto:"):
+                addr = href.split(":", 1)[1].split("?", 1)[0]
+                self.add_email(addr)
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)

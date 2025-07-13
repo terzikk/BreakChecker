@@ -19,8 +19,9 @@ script.
 
 # This script gathers subdomains for a target domain, crawls each host for
 # contact information such as emails and phone numbers, and optionally checks
-# discovered emails against public breach data. All emails and phone numbers
-# are normalized and deduplicated before breach checks and saving to disk.
+# discovered emails against public breach data. Emails are deduplicated
+# case-insensitively but saved exactly as found. Phone numbers are normalized
+# only for deduplication; the original values are written to disk.
 
 
 import os
@@ -139,11 +140,9 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         output = result.stdout
         urls.update(URL_RE.findall(output))
         for email in EMAIL_RE.findall(output):
-            emails.add(normalize_email(email))
+            emails.add(email.strip())
         for phone in PHONE_RE.findall(output):
-            norm = normalize_phone(phone)
-            if norm:
-                phones.add(norm)
+            phones.add(phone.strip())
     except Exception:
         pass
 
@@ -194,9 +193,21 @@ class Crawler:
         self.concurrency = concurrency
         # Track visited URLs to avoid loops
         self.visited: Set[str] = set()
-        # Containers for discovered data
-        self.emails: Set[str] = set()
-        self.phones: Set[str] = set()
+        # Containers for discovered data (canonical -> original)
+        self.emails: dict[str, str] = {}
+        self.phones: dict[str, str] = {}
+
+    def add_email(self, email: str) -> None:
+        """Store email if not already seen (case-insensitive)."""
+        canon = normalize_email(email)
+        if canon not in self.emails:
+            self.emails[canon] = email.strip()
+
+    def add_phone(self, phone: str) -> None:
+        """Store phone if valid and not already seen."""
+        norm = normalize_phone(phone)
+        if norm and norm not in self.phones:
+            self.phones[norm] = phone.strip()
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -236,11 +247,9 @@ class Crawler:
     def extract_data(self, text: str):
         """Pull data of interest out of page text."""
         for email in EMAIL_RE.findall(text):
-            self.emails.add(normalize_email(email))
+            self.add_email(email)
         for phone in PHONE_RE.findall(text):
-            norm = normalize_phone(phone)
-            if norm:
-                self.phones.add(norm)
+            self.add_phone(phone)
 
 
 # ---------------------- Breach checkers ----------------------
@@ -300,8 +309,10 @@ async def main():
             start_url = f"{scheme}://{sub}"
             print(f"\nRunning katana on {start_url} ...")
             urls, emails, phones = gather_with_katana(start_url, depth, field_file)
-            crawler.emails.update(emails)
-            crawler.phones.update(phones)
+            for e in emails:
+                crawler.add_email(e)
+            for p in phones:
+                crawler.add_phone(p)
             if not urls:
                 urls = {start_url}
             for link in urls:
@@ -316,7 +327,7 @@ async def main():
 
     # ---- check breach APIs ----
     breached_emails = {}
-    for email in crawler.emails:
+    for email in crawler.emails.values():
         breaches = check_hibp(email, hibp_key)
         if breaches:
             breached_emails[email] = breaches
@@ -326,8 +337,8 @@ async def main():
             for item in sorted(data):
                 f.write(item + "\n")
 
-    save_set("emails.txt", crawler.emails)
-    save_set("phones.txt", crawler.phones)
+    save_set("emails.txt", set(crawler.emails.values()))
+    save_set("phones.txt", set(crawler.phones.values()))
     save_set("breached_emails.txt", set(breached_emails.keys()))
 
     # ---- print summary to console ----

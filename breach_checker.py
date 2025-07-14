@@ -247,6 +247,54 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
+# ---------------------- High level scan function ----------------------
+
+async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False) -> dict:
+    """Crawl a domain and optionally check emails against HIBP."""
+    if verbose:
+        print(f"Enumerating subdomains for {domain}...")
+    subdomains = enumerate_subdomains(domain)
+    if verbose:
+        for sub in sorted(subdomains):
+            print(f" [+] {sub}")
+
+    use_katana = shutil.which("katana") is not None
+    field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
+
+    if use_katana and verbose:
+        print("Using katana for deep enumeration")
+
+    crawler = Crawler(domain, max_depth=0 if use_katana else depth)
+
+    for sub in subdomains:
+        scheme = choose_scheme(sub)
+        start_url = f"{scheme}://{sub}"
+        if verbose:
+            print(f"\nCrawling {start_url} ...")
+        if use_katana:
+            urls, emails, phones = gather_with_katana(start_url, depth, field_file)
+            crawler.emails.update(emails)
+            crawler.phones.update(phones)
+            if not urls:
+                urls = {start_url}
+            for link in urls:
+                await crawler.crawl(link)
+        else:
+            await crawler.crawl(start_url)
+
+    breached_emails = {}
+    for email in crawler.emails:
+        breaches = check_hibp(email, hibp_key)
+        if breaches:
+            breached_emails[email] = breaches
+
+    return {
+        "crawler": crawler,
+        "subdomains": subdomains,
+        "breached_emails": breached_emails,
+    }
+
+
 
 # ---------------------- Main logic ----------------------
 
@@ -263,43 +311,10 @@ async def main():
     depth = int(os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
 
-    print(f"Enumerating subdomains for {domain}...")
-    subdomains = enumerate_subdomains(domain)
-    for sub in sorted(subdomains):
-        print(f" [+] {sub}")
-
-    # ---- crawl each discovered host ----
-
-    use_katana = shutil.which("katana") is not None
-    field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
-    if use_katana:
-        print("Using katana for deep enumeration")
-        crawler = Crawler(domain, max_depth=0)
-        for sub in subdomains:
-            scheme = choose_scheme(sub)
-            start_url = f"{scheme}://{sub}"
-            print(f"\nRunning katana on {start_url} ...")
-            urls, emails, phones = gather_with_katana(start_url, depth, field_file)
-            crawler.emails.update(emails)
-            crawler.phones.update(phones)
-            if not urls:
-                urls = {start_url}
-            for link in urls:
-                await crawler.crawl(link)
-    else:
-        crawler = Crawler(domain, max_depth=depth)
-        for sub in subdomains:
-            scheme = choose_scheme(sub)
-            url = f"{scheme}://{sub}"
-            print(f"\nCrawling {url} ...")
-            await crawler.crawl(url)
-
-    # ---- check breach APIs ----
-    breached_emails = {}
-    for email in crawler.emails:
-        breaches = check_hibp(email, hibp_key)
-        if breaches:
-            breached_emails[email] = breaches
+    results = await scan_domain(domain, depth, hibp_key, verbose=True)
+    crawler = results["crawler"]
+    subdomains = results["subdomains"]
+    breached_emails = results["breached_emails"]
     # ---- write results to files ----
     def save_set(filename: str, data: Set[str]):
         with open(filename, "w", encoding="utf-8") as f:

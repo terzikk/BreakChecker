@@ -19,7 +19,9 @@ script.
 
 # This script gathers subdomains for a target domain, crawls each host for
 # contact information such as emails and phone numbers, and optionally checks
-# discovered emails against public breach data.
+# discovered emails against public breach data. Emails are deduplicated
+# case-insensitively but saved exactly as found. Phone numbers are validated
+# and stored in a uniform digits-only format for easier processing.
 
 
 import os
@@ -162,8 +164,52 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
 # Regular expressions used during scraping
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
-EMAIL_RE = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}")
+# Common file extensions that should not be treated as valid email TLDs.  These
+# often appear in asset paths like ``image@2x.png`` and can be misdetected as
+# emails if we are not careful.
+EMAIL_IGNORE_EXTS = (
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "bmp",
+    "webp",
+    "ico",
+    "css",
+    "js",
+    "json",
+    "xml",
+    "csv",
+    "txt",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+)
+
+# Email regex with a negative lookahead so addresses ending with the above
+# extensions are ignored.
+EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!(?:"
+    + "|".join(EMAIL_IGNORE_EXTS)
+    + r")\b)[a-zA-Z]{2,}"
+)
 PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
+
+
+def normalize_email(email: str) -> str:
+    """Return a canonical form of an email address for deduplication."""
+    return email.strip().lower()
+
+
+def normalize_phone(phone: str) -> Optional[str]:
+    """Return a digits-only phone number if it appears valid."""
+    digits = re.sub(r"\D", "", phone)
+    if 7 <= len(digits) <= 15:
+        return digits
+    return None
 
 
 class Crawler:
@@ -178,9 +224,21 @@ class Crawler:
         self.concurrency = concurrency
         # Track visited URLs to avoid loops
         self.visited: Set[str] = set()
-        # Containers for discovered data
-        self.emails: Set[str] = set()
-        self.phones: Set[str] = set()
+        # Containers for discovered data (canonical -> original)
+        self.emails: dict[str, str] = {}
+        self.phones: dict[str, str] = {}
+
+    def add_email(self, email: str) -> None:
+        """Store email if not already seen (case-insensitive)."""
+        canon = normalize_email(email)
+        if canon not in self.emails:
+            self.emails[canon] = email.strip()
+
+    def add_phone(self, phone: str) -> None:
+        """Store phone in digits-only form if valid and not already seen."""
+        norm = normalize_phone(phone)
+        if norm and norm not in self.phones:
+            self.phones[norm] = norm
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -203,6 +261,14 @@ class Crawler:
             return
         self.extract_data(content)
         soup = BeautifulSoup(content, "html.parser")
+        # also search the rendered text for emails split by HTML tags
+        self.extract_data(soup.get_text(" "))
+        # capture mailto: links explicitly (case-insensitive)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().startswith("mailto:"):
+                addr = href.split(":", 1)[1].split("?", 1)[0]
+                self.add_email(addr)
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)
@@ -219,8 +285,10 @@ class Crawler:
 
     def extract_data(self, text: str):
         """Pull data of interest out of page text."""
-        self.emails.update(EMAIL_RE.findall(text))
-        self.phones.update(PHONE_RE.findall(text))
+        for email in EMAIL_RE.findall(text):
+            self.add_email(email)
+        for phone in PHONE_RE.findall(text):
+            self.add_phone(phone)
 
 
 # ---------------------- Breach checkers ----------------------
@@ -247,6 +315,56 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
+# ---------------------- High level scan function ----------------------
+
+async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False) -> dict:
+    """Crawl a domain and optionally check emails against HIBP."""
+    if verbose:
+        print(f"Enumerating subdomains for {domain}...")
+    subdomains = enumerate_subdomains(domain)
+    if verbose:
+        for sub in sorted(subdomains):
+            print(f" [+] {sub}")
+
+    use_katana = shutil.which("katana") is not None
+    field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
+
+    if use_katana and verbose:
+        print("Using katana for deep enumeration")
+
+    crawler = Crawler(domain, max_depth=0 if use_katana else depth)
+
+    for sub in subdomains:
+        scheme = choose_scheme(sub)
+        start_url = f"{scheme}://{sub}"
+        if verbose:
+            print(f"\nCrawling {start_url} ...")
+        if use_katana:
+            urls, emails, phones = gather_with_katana(start_url, depth, field_file)
+            for e in emails:
+                crawler.add_email(e)
+            for p in phones:
+                crawler.add_phone(p)
+            if not urls:
+                urls = {start_url}
+            for link in urls:
+                await crawler.crawl(link)
+        else:
+            await crawler.crawl(start_url)
+
+    breached_emails = {}
+    for email in crawler.emails.values():
+        breaches = check_hibp(email, hibp_key)
+        if breaches:
+            breached_emails[email] = breaches
+
+    return {
+        "crawler": crawler,
+        "subdomains": subdomains,
+        "breached_emails": breached_emails,
+    }
+
+
 
 # ---------------------- Main logic ----------------------
 
@@ -263,51 +381,18 @@ async def main():
     depth = int(os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
 
-    print(f"Enumerating subdomains for {domain}...")
-    subdomains = enumerate_subdomains(domain)
-    for sub in sorted(subdomains):
-        print(f" [+] {sub}")
-
-    # ---- crawl each discovered host ----
-
-    use_katana = shutil.which("katana") is not None
-    field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
-    if use_katana:
-        print("Using katana for deep enumeration")
-        crawler = Crawler(domain, max_depth=0)
-        for sub in subdomains:
-            scheme = choose_scheme(sub)
-            start_url = f"{scheme}://{sub}"
-            print(f"\nRunning katana on {start_url} ...")
-            urls, emails, phones = gather_with_katana(start_url, depth, field_file)
-            crawler.emails.update(emails)
-            crawler.phones.update(phones)
-            if not urls:
-                urls = {start_url}
-            for link in urls:
-                await crawler.crawl(link)
-    else:
-        crawler = Crawler(domain, max_depth=depth)
-        for sub in subdomains:
-            scheme = choose_scheme(sub)
-            url = f"{scheme}://{sub}"
-            print(f"\nCrawling {url} ...")
-            await crawler.crawl(url)
-
-    # ---- check breach APIs ----
-    breached_emails = {}
-    for email in crawler.emails:
-        breaches = check_hibp(email, hibp_key)
-        if breaches:
-            breached_emails[email] = breaches
+    results = await scan_domain(domain, depth, hibp_key, verbose=True)
+    crawler = results["crawler"]
+    subdomains = results["subdomains"]
+    breached_emails = results["breached_emails"]
     # ---- write results to files ----
     def save_set(filename: str, data: Set[str]):
         with open(filename, "w", encoding="utf-8") as f:
             for item in sorted(data):
                 f.write(item + "\n")
 
-    save_set("emails.txt", crawler.emails)
-    save_set("phones.txt", crawler.phones)
+    save_set("emails.txt", set(crawler.emails.values()))
+    save_set("phones.txt", set(crawler.phones.values()))
     save_set("breached_emails.txt", set(breached_emails.keys()))
 
     # ---- print summary to console ----

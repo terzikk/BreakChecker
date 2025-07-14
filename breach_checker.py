@@ -19,7 +19,9 @@ script.
 
 # This script gathers subdomains for a target domain, crawls each host for
 # contact information such as emails and phone numbers, and optionally checks
-# discovered emails against public breach data.
+# discovered emails against public breach data. Emails are deduplicated
+# case-insensitively but saved exactly as found. Phone numbers are validated
+# and stored in a uniform digits-only format for easier processing.
 
 
 import os
@@ -166,6 +168,19 @@ EMAIL_RE = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
 
 
+def normalize_email(email: str) -> str:
+    """Return a canonical form of an email address for deduplication."""
+    return email.strip().lower()
+
+
+def normalize_phone(phone: str) -> Optional[str]:
+    """Return a digits-only phone number if it appears valid."""
+    digits = re.sub(r"\D", "", phone)
+    if 7 <= len(digits) <= 15:
+        return digits
+    return None
+
+
 class Crawler:
     """Simple asynchronous breadth-first crawler limited to the target domain."""
 
@@ -178,9 +193,21 @@ class Crawler:
         self.concurrency = concurrency
         # Track visited URLs to avoid loops
         self.visited: Set[str] = set()
-        # Containers for discovered data
-        self.emails: Set[str] = set()
-        self.phones: Set[str] = set()
+        # Containers for discovered data (canonical -> original)
+        self.emails: dict[str, str] = {}
+        self.phones: dict[str, str] = {}
+
+    def add_email(self, email: str) -> None:
+        """Store email if not already seen (case-insensitive)."""
+        canon = normalize_email(email)
+        if canon not in self.emails:
+            self.emails[canon] = email.strip()
+
+    def add_phone(self, phone: str) -> None:
+        """Store phone in digits-only form if valid and not already seen."""
+        norm = normalize_phone(phone)
+        if norm and norm not in self.phones:
+            self.phones[norm] = norm
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -203,6 +230,14 @@ class Crawler:
             return
         self.extract_data(content)
         soup = BeautifulSoup(content, "html.parser")
+        # also search the rendered text for emails split by HTML tags
+        self.extract_data(soup.get_text(" "))
+        # capture mailto: links explicitly (case-insensitive)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().startswith("mailto:"):
+                addr = href.split(":", 1)[1].split("?", 1)[0]
+                self.add_email(addr)
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)
@@ -219,8 +254,10 @@ class Crawler:
 
     def extract_data(self, text: str):
         """Pull data of interest out of page text."""
-        self.emails.update(EMAIL_RE.findall(text))
-        self.phones.update(PHONE_RE.findall(text))
+        for email in EMAIL_RE.findall(text):
+            self.add_email(email)
+        for phone in PHONE_RE.findall(text):
+            self.add_phone(phone)
 
 
 # ---------------------- Breach checkers ----------------------
@@ -273,8 +310,10 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             print(f"\nCrawling {start_url} ...")
         if use_katana:
             urls, emails, phones = gather_with_katana(start_url, depth, field_file)
-            crawler.emails.update(emails)
-            crawler.phones.update(phones)
+            for e in emails:
+                crawler.add_email(e)
+            for p in phones:
+                crawler.add_phone(p)
             if not urls:
                 urls = {start_url}
             for link in urls:
@@ -283,7 +322,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             await crawler.crawl(start_url)
 
     breached_emails = {}
-    for email in crawler.emails:
+    for email in crawler.emails.values():
         breaches = check_hibp(email, hibp_key)
         if breaches:
             breached_emails[email] = breaches
@@ -321,8 +360,8 @@ async def main():
             for item in sorted(data):
                 f.write(item + "\n")
 
-    save_set("emails.txt", crawler.emails)
-    save_set("phones.txt", crawler.phones)
+    save_set("emails.txt", set(crawler.emails.values()))
+    save_set("phones.txt", set(crawler.phones.values()))
     save_set("breached_emails.txt", set(breached_emails.keys()))
 
     # ---- print summary to console ----

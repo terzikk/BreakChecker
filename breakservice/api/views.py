@@ -31,8 +31,8 @@ class ScanView(APIView):
         return Response(
             {
                 "subdomains": sorted(results["subdomains"]),
-                "emails": sorted(crawler.emails),
-                "phones": sorted(crawler.phones),
+                "emails": sorted(crawler.emails.values()),
+                "phones": sorted(crawler.phones.values()),
                 "breached_emails": results["breached_emails"],
             }
         )

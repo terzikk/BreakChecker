@@ -1,3 +1,5 @@
 requests
 beautifulsoup4
 aiohttp
+django
+djangorestframework

@@ -44,6 +44,7 @@ import aiohttp
 
 # ---------------------- Helper functions ----------------------
 
+
 def load_config() -> dict:
     """Load optional API keys and settings from config.json."""
     config = {
@@ -60,8 +61,13 @@ def load_config() -> dict:
         pass
     return config
 
+
 def enumerate_subdomains(domain: str) -> Set[str]:
-    """Enumerate subdomains using subfinder if available or crt.sh fallback."""
+    """Enumerate subdomains using subfinder if available or crt.sh fallback.
+
+    Wildcard entries like ``*.example.com`` are stripped of the ``*`` to avoid
+    invalid hostnames being crawled.
+    """
     subs = set()
     # Try the "subfinder" tool first as it is fast and comprehensive
     if shutil.which("subfinder"):
@@ -72,7 +78,8 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                 "-d",
                 domain,
             ], capture_output=True, text=True, check=False, timeout=60)
-            subs.update(line.strip() for line in result.stdout.splitlines() if line.strip())
+            subs.update(line.strip()
+                        for line in result.stdout.splitlines() if line.strip())
         except Exception:
             # Ignore failures and fall back to web-based enumeration
             pass
@@ -86,8 +93,10 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                 for entry in data:
                     name_value = entry.get("name_value", "")
                     for sub in name_value.split("\n"):
-                        sub = sub.strip()
-                        if sub.endswith(domain):
+                        sub = sub.strip().lower()
+                        if '*' in sub:
+                            sub = sub.lstrip('*.')
+                        if sub and sub.endswith(domain):
                             subs.add(sub)
         except Exception:
             # Any network/JSON error simply results in returning the main domain
@@ -101,7 +110,8 @@ def choose_scheme(host: str) -> str:
     """Return 'https' if the host appears reachable via HTTPS, else 'http'."""
     for scheme in ("https", "http"):
         try:
-            resp = requests.head(f"{scheme}://{host}", timeout=5, allow_redirects=True)
+            resp = requests.head(f"{scheme}://{host}",
+                                 timeout=5, allow_redirects=True)
             if resp.status_code < 400:
                 return scheme
         except Exception:
@@ -139,8 +149,10 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         )
         output = result.stdout
         urls.update(URL_RE.findall(output))
-        emails.update(EMAIL_RE.findall(output))
-        phones.update(PHONE_RE.findall(output))
+        for email in EMAIL_RE.findall(output):
+            emails.add(email.strip())
+        for phone in PHONE_RE.findall(output):
+            phones.add(phone.strip())
     except Exception:
         pass
 
@@ -164,8 +176,51 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
 # Regular expressions used during scraping
 URL_RE = re.compile(r"https?://[^\s'\"<>]+")
-EMAIL_RE = re.compile(r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\s\-]{7,}\d")
+# Common file extensions that should not be treated as valid email TLDs.  These
+# often appear in asset paths like ``image@2x.png`` and can be misdetected as
+EMAIL_IGNORE_EXTS = (
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "bmp",
+    "webp",
+    "ico",
+    "css",
+    "js",
+    "json",
+    "xml",
+    "csv",
+    "txt",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+)
+
+# Email regex with a negative lookahead so addresses ending with the above
+# extensions are ignored.
+EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!(?:"
+    + "|".join(EMAIL_IGNORE_EXTS)
+    + r")\b)[a-zA-Z]{2,}"
+)
+PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
+
+
+def normalize_email(email: str) -> str:
+    """Return a canonical form of an email address for deduplication."""
+    return email.strip().lower()
+
+
+def normalize_phone(phone: str) -> Optional[str]:
+    """Return a digits-only phone number if it appears valid."""
+    digits = re.sub(r"\D", "", phone)
+    if 7 <= len(digits) <= 15:
+        return digits
+    return None
 
 
 def normalize_email(email: str) -> str:
@@ -283,8 +338,8 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
         pass
     return None
 
-
 # ---------------------- High level scan function ----------------------
+
 
 async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False) -> dict:
     """Crawl a domain and optionally check emails against HIBP."""
@@ -334,7 +389,6 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     }
 
 
-
 # ---------------------- Main logic ----------------------
 
 async def main():
@@ -355,6 +409,7 @@ async def main():
     subdomains = results["subdomains"]
     breached_emails = results["breached_emails"]
     # ---- write results to files ----
+
     def save_set(filename: str, data: Set[str]):
         with open(filename, "w", encoding="utf-8") as f:
             for item in sorted(data):
@@ -383,4 +438,3 @@ async def main():
 # Run when executed directly
 if __name__ == "__main__":
     asyncio.run(main())
-

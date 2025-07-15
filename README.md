@@ -2,6 +2,14 @@
 
 This repository crawls a domain, collects emails/phones, and checks them against breach data. A simple Django REST Framework microservice exposes this functionality over HTTP.
 
+## Installation
+
+Install the pinned dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
 ## Configuration
 
 Two environment variables configure the crawler:

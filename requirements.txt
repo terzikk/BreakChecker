@@ -1,5 +1,5 @@
-requests
-beautifulsoup4
-aiohttp
-django
-djangorestframework
+requests~=2.31
+beautifulsoup4~=4.13
+aiohttp~=3.9
+django~=4.2
+djangorestframework~=3.14

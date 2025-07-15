@@ -223,6 +223,19 @@ def normalize_phone(phone: str) -> Optional[str]:
     return None
 
 
+def normalize_email(email: str) -> str:
+    """Return a canonical form of an email address for deduplication."""
+    return email.strip().lower()
+
+
+def normalize_phone(phone: str) -> Optional[str]:
+    """Return a digits-only phone number if it appears valid."""
+    digits = re.sub(r"\D", "", phone)
+    if 7 <= len(digits) <= 15:
+        return digits
+    return None
+
+
 class Crawler:
     """Simple asynchronous breadth-first crawler limited to the target domain."""
 
@@ -351,8 +364,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
         if verbose:
             print(f"\nCrawling {start_url} ...")
         if use_katana:
-            urls, emails, phones = gather_with_katana(
-                start_url, depth, field_file)
+            urls, emails, phones = gather_with_katana(start_url, depth, field_file)
             for e in emails:
                 crawler.add_email(e)
             for p in phones:

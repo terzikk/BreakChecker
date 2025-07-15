@@ -223,18 +223,6 @@ def normalize_phone(phone: str) -> Optional[str]:
     return None
 
 
-def normalize_email(email: str) -> str:
-    """Return a canonical form of an email address for deduplication."""
-    return email.strip().lower()
-
-
-def normalize_phone(phone: str) -> Optional[str]:
-    """Return a digits-only phone number if it appears valid."""
-    digits = re.sub(r"\D", "", phone)
-    if 7 <= len(digits) <= 15:
-        return digits
-    return None
-
 
 class Crawler:
     """Simple asynchronous breadth-first crawler limited to the target domain."""

@@ -57,3 +57,17 @@ Then send a POST request to `/api/scan/` with JSON:
 
 The response includes discovered subdomains, emails, phones and breach info.
 
+## Deploying with Docker Compose
+
+The repository includes a `Dockerfile` and `docker-compose.yml` for running the
+service in a container. Set the required environment variables and start the
+stack:
+
+```bash
+export HIBP_API_KEY=YOUR_HIBP_KEY
+# optional: export CRAWL_DEPTH=2
+docker-compose up --build
+```
+
+The API will be available on `http://localhost:8000/`.
+

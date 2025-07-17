@@ -24,13 +24,12 @@ class ScanView(APIView):
         hibp_key = os.environ.get("HIBP_API_KEY")
 
         results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-        crawler = results["crawler"]
 
         return Response(
             {
                 "subdomains": sorted(results["subdomains"]),
-                "emails": sorted(crawler.emails.values()),
-                "phones": sorted(crawler.phones.values()),
+                "emails": sorted(results["emails"]),
+                "phones": sorted(results["phones"]),
                 "breached_emails": results["breached_emails"],
             }
         )

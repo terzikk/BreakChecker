@@ -28,23 +28,6 @@ class ScanView(APIView):
             logging.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)
 
-<<<<<<< Updated upstream
-        depth = int(request.data.get(
-            "depth", os.environ.get("CRAWL_DEPTH", 3)))
-        hibp_key = os.environ.get("HIBP_API_KEY")
-
-        results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-        crawler = results["crawler"]
-
-        return Response(
-            {
-                "subdomains": sorted(results["subdomains"]),
-                "emails": sorted(crawler.emails.values()),
-                "phones": sorted(crawler.phones.values()),
-                "breached_emails": results["breached_emails"],
-            }
-        )
-=======
         payload = {
             "summary": {
                 "num_subdomains":     len(results["subdomains"]),
@@ -58,4 +41,3 @@ class ScanView(APIView):
             "breached_emails": results["breached_emails"],
         }
         return Response(payload)
->>>>>>> Stashed changes

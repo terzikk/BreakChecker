@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+emails.txt
+phones.txt
+breached_emails.txt

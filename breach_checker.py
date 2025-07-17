@@ -330,7 +330,12 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
 
 
 async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False) -> dict:
-    """Crawl a domain and optionally check emails against HIBP."""
+    """Crawl a domain and optionally check emails against HIBP.
+
+    The returned dictionary now exposes the discovered subdomains, emails and
+    phone numbers directly so callers like the microservice can easily
+    serialize the data as JSON.
+    """
     if verbose:
         print(f"Enumerating subdomains for {domain}...")
     subdomains = enumerate_subdomains(domain)
@@ -370,9 +375,12 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
         if breaches:
             breached_emails[email] = breaches
 
+    # Expose the collected data directly for easier consumption by callers.
     return {
         "crawler": crawler,
         "subdomains": subdomains,
+        "emails": set(crawler.emails.values()),
+        "phones": set(crawler.phones.values()),
         "breached_emails": breached_emails,
     }
 
@@ -393,8 +401,9 @@ async def main():
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
 
     results = await scan_domain(domain, depth, hibp_key, verbose=True)
-    crawler = results["crawler"]
     subdomains = results["subdomains"]
+    emails = results["emails"]
+    phones = results["phones"]
     breached_emails = results["breached_emails"]
     # ---- write results to files ----
 
@@ -403,15 +412,15 @@ async def main():
             for item in sorted(data):
                 f.write(item + "\n")
 
-    save_set("emails.txt", set(crawler.emails.values()))
-    save_set("phones.txt", set(crawler.phones.values()))
+    save_set("emails.txt", emails)
+    save_set("phones.txt", phones)
     save_set("breached_emails.txt", set(breached_emails.keys()))
 
     # ---- print summary to console ----
     print("\n--------- Summary ---------")
-    print(f"Emails found: {len(crawler.emails)}")
+    print(f"Emails found: {len(emails)}")
     print(f"Breached emails: {len(breached_emails)}")
-    print(f"Phone numbers found: {len(crawler.phones)}")
+    print(f"Phone numbers found: {len(phones)}")
 
     if breached_emails:
         print("\nBreached Emails:")

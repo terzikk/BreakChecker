@@ -4,3 +4,4 @@ aiohttp~=3.9
 django~=4.2
 djangorestframework~=3.14
 gunicorn~=21.2
+phonenumbers~=8.13

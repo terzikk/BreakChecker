@@ -21,7 +21,7 @@ script.
 # contact information such as emails and phone numbers, and optionally checks
 # discovered emails against public breach data. Emails are deduplicated
 # case-insensitively but saved exactly as found. Phone numbers are validated
-# and stored in a uniform digits-only format for easier processing.
+# and stored in a normalized E.164 format for easier processing.
 
 
 import os
@@ -37,6 +37,7 @@ import shutil
 import subprocess
 from typing import Set, List, Optional
 import aiohttp
+import phonenumbers
 
 # Standard library modules provide URL handling and queues while
 # requests/BeautifulSoup handle HTTP fetching and parsing. "subprocess" is
@@ -216,10 +217,15 @@ def normalize_email(email: str) -> str:
 
 
 def normalize_phone(phone: str) -> Optional[str]:
-    """Return a digits-only phone number if it appears valid."""
-    digits = re.sub(r"\D", "", phone)
-    if 7 <= len(digits) <= 15:
-        return digits
+    """Return the phone number in E.164 format if it appears valid."""
+    try:
+        parsed = phonenumbers.parse(phone, None)
+        if phonenumbers.is_valid_number(parsed):
+            return phonenumbers.format_number(
+                parsed, phonenumbers.PhoneNumberFormat.E164
+            )
+    except phonenumbers.NumberParseException:
+        pass
     return None
 
 
@@ -247,7 +253,7 @@ class Crawler:
             self.emails[canon] = email.strip()
 
     def add_phone(self, phone: str) -> None:
-        """Store phone in digits-only form if valid and not already seen."""
+        """Store phone in normalized form if valid and not already seen."""
         norm = normalize_phone(phone)
         if norm and norm not in self.phones:
             self.phones[norm] = norm

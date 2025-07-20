@@ -20,10 +20,15 @@ class ScanView(APIView):
             depth = int(request.data.get(
                 "depth", os.environ.get("CRAWL_DEPTH", 3)))
             hibp_key = os.environ.get("HIBP_API_KEY")
-            logging.warning(
+            logging.info(
                 "SCAN: Starting scan for %s (depth=%s)", domain, depth)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-            logging.warning("SCAN: Scan completed for %s", domain)
+            logging.info("SCAN: Scan completed for %s", domain)
+            logging.info(
+                "SCAN: emails=%d phones=%d breached=%d", 
+                len(results["emails"]),
+                len(results["phones"]),
+                len(results["breached_emails"]))
         except Exception as e:
             logging.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)

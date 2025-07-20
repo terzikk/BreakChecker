@@ -41,6 +41,18 @@ from typing import Set, List, Optional
 import aiohttp
 from playwright.async_api import async_playwright
 
+LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
+)
+
+logger = logging.getLogger(__name__)
+
 
 LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
 logging.basicConfig(
@@ -271,20 +283,29 @@ class Crawler:
         # Containers for discovered data (canonical -> original)
         self.emails: dict[str, str] = {}
         self.phones: dict[str, str] = {}
+        # Maps for the first seen location of each item
+        self.email_sources: dict[str, str] = {}
+        self.phone_sources: dict[str, str] = {}
 
-    def add_email(self, email: str) -> None:
+    def add_email(self, email: str, source: str, snippet: str = "") -> None:
         """Store email if not already seen (case-insensitive)."""
         canon = normalize_email(email)
         if canon not in self.emails:
             self.emails[canon] = email.strip()
-            logger.debug("Added email %s", email)
+            self.email_sources[canon] = source
+        logger.debug("Email %s found at %s | %s", email, source, snippet)
 
-    def add_phone(self, phone: str) -> None:
+
+    def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
         """Store phone in normalized form if valid and not already seen."""
         norm = normalize_phone(phone)
-        if norm and norm not in self.phones:
-            self.phones[norm] = norm
-            logger.debug("Added phone %s", norm)
+
+        if norm:
+            if norm not in self.phones:
+                self.phones[norm] = norm
+                self.phone_sources[norm] = source
+            logger.debug("Phone %s found at %s | %s", norm, source, snippet)
+
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -309,16 +330,16 @@ class Crawler:
         content = await fetch_url(session, url)
         if not content:
             return
-        self.extract_data(content)
+        self.extract_data(content, url)
         soup = BeautifulSoup(content, "html.parser")
         # also search the rendered text for emails split by HTML tags
-        self.extract_data(soup.get_text(" "))
+        self.extract_data(soup.get_text(" "), url)
         # capture mailto: links explicitly (case-insensitive)
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href.lower().startswith("mailto:"):
                 addr = href.split(":", 1)[1].split("?", 1)[0]
-                self.add_email(addr)
+                self.add_email(addr, url, "mailto link")
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)
@@ -335,16 +356,20 @@ class Crawler:
                     queue.append((src, depth + 1))
                     logger.debug("Discovered script %s", src)
 
-    def extract_data(self, text: str):
+    def extract_data(self, text: str, url: str):
         """Pull data of interest out of page text."""
-        email_matches = EMAIL_RE.findall(text)
-        phone_matches = PHONE_RE.findall(text)
-        for email in email_matches:
-            self.add_email(email)
-        for phone in phone_matches:
-            self.add_phone(phone)
+        email_matches = list(EMAIL_RE.finditer(text))
+        phone_matches = list(PHONE_RE.finditer(text))
+        for m in email_matches:
+            snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
+            self.add_email(m.group(), url, snippet)
+        for m in phone_matches:
+            snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
+            self.add_phone(m.group(), url, snippet)
         if email_matches or phone_matches:
-            logger.debug("Extracted %d emails and %d phones", len(email_matches), len(phone_matches))
+            logger.debug(
+                "Extracted %d emails and %d phones", len(email_matches), len(phone_matches)
+            )
 
 
 # ---------------------- Breach checkers ----------------------
@@ -414,9 +439,9 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             urls, emails, phones = gather_with_katana(
                 start_url, depth, field_file)
             for e in emails:
-                crawler.add_email(e)
+                crawler.add_email(e, start_url, "katana")
             for p in phones:
-                crawler.add_phone(p)
+                crawler.add_phone(p, start_url, "katana")
             if not urls:
                 urls = {start_url}
             for link in urls:
@@ -439,6 +464,8 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
         "emails": set(crawler.emails.values()),
         "phones": set(crawler.phones.values()),
         "breached_emails": breached_emails,
+        "email_sources": crawler.email_sources,
+        "phone_sources": crawler.phone_sources,
     }
 
 
@@ -463,15 +490,22 @@ async def main():
     emails = results["emails"]
     phones = results["phones"]
     breached_emails = results["breached_emails"]
+    crawler = results["crawler"]
     # ---- write results to files ----
+
+    def save_map(filename: str, values: dict[str, str], sources: dict[str, str]):
+        with open(filename, "w", encoding="utf-8") as f:
+            for canon, value in sorted(values.items()):
+                src = sources.get(canon, "")
+                f.write(f"{value}\t{src}\n")
 
     def save_set(filename: str, data: Set[str]):
         with open(filename, "w", encoding="utf-8") as f:
             for item in sorted(data):
                 f.write(item + "\n")
 
-    save_set("emails.txt", emails)
-    save_set("phones.txt", phones)
+    save_map("emails.txt", crawler.emails, crawler.email_sources)
+    save_map("phones.txt", crawler.phones, crawler.phone_sources)
     save_set("breached_emails.txt", set(breached_emails.keys()))
     logger.info("Results written to output files")
 

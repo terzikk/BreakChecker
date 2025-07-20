@@ -44,5 +44,7 @@ class ScanView(APIView):
             "emails":          sorted(results["emails"]),
             "phones":          sorted(results["phones"]),
             "breached_emails": results["breached_emails"],
+            "email_sources":   results["email_sources"],
+            "phone_sources":   results["phone_sources"],
         }
         return Response(payload)

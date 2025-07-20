@@ -41,6 +41,7 @@ from typing import Set, List, Optional
 import aiohttp
 from playwright.async_api import async_playwright
 
+
 LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
 logging.basicConfig(
     level=logging.INFO,
@@ -494,4 +495,6 @@ async def main():
 
 # Run when executed directly
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s:%(name)s:%(message)s")
     results = asyncio.run(main())

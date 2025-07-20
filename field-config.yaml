@@ -1,7 +1,7 @@
 - name: email
   type: regex
   regex:
-    - '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!(?:png|jpg|jpeg|gif|svg|bmp|webp|ico|css|js|json|xml|csv|txt|pdf|doc|docx|xls|xlsx)\b)[a-zA-Z]{2,}'
+    - '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
 - name: phone
   type: regex

@@ -42,17 +42,25 @@ from typing import Set, List, Optional
 import aiohttp
 from playwright.async_api import async_playwright
 
-LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
-formatter = logging.Formatter(
-    "%(asctime)s %(levelname)s:%(name)s:%(message)s")
-file_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=1_000_000, backupCount=3)
-stream_handler = logging.StreamHandler()
-for handler in (file_handler, stream_handler):
-    handler.setFormatter(formatter)
-logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 
-logger = logging.getLogger(__name__)
+def configure_logging() -> logging.Logger:
+    """Configure root logging with rotation and console output."""
+    log_file = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s:%(name)s:%(message)s")
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=1_000_000, backupCount=3)
+        stream_handler = logging.StreamHandler()
+        for handler in (file_handler, stream_handler):
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
+    return logging.getLogger(__name__)
+
+
+logger = configure_logging()
 
 
 # Standard library modules provide URL handling and queues while
@@ -173,15 +181,16 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
             stderr=subprocess.STDOUT,
             text=True,
         )
-        output_lines = []
         for line in proc.stdout:
-            output_lines.append(line)
-            logger.info("[katana] %s", line.strip())
-            urls.update(URL_RE.findall(line))
+            for u in URL_RE.findall(line):
+                urls.add(u)
+                logger.info("katana crawling %s", u)
             for email in EMAIL_RE.findall(line):
                 emails.add(email.strip())
+                logger.info("katana found email %s", email.strip())
             for phone in PHONE_RE.findall(line):
                 phones.add(phone.strip())
+                logger.info("katana found phone %s", phone.strip())
         proc.wait(timeout=60 * depth)
         logger.debug(
             "katana found %d urls, %d emails, %d phones", len(urls), len(emails), len(phones)
@@ -195,7 +204,7 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
 async def fetch_url(session, url: str) -> Optional[str]:
     """Fetch a URL using Playwright (for JavaScript-rendered content)."""
     try:
-        logger.debug("Fetching %s", url)
+        logger.info("Fetching %s", url)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -287,7 +296,7 @@ class Crawler:
         if canon not in self.emails:
             self.emails[canon] = email.strip()
             self.email_sources[canon] = source
-        logger.debug("Email %s found at %s | %s", email, source, snippet)
+        logger.info("Email %s found at %s | %s", email, source, snippet)
 
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
@@ -298,7 +307,7 @@ class Crawler:
             if norm not in self.phones:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
-            logger.debug("Phone %s found at %s | %s", norm, source, snippet)
+            logger.info("Phone %s found at %s | %s", norm, source, snippet)
 
 
     async def crawl(self, start_url: str):
@@ -479,9 +488,13 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             breached_emails[email] = breaches
 
     # Expose the collected data directly for easier consumption by callers.
-    logger.info("Scan complete: %d emails, %d phones, %d breached emails",
-                len(crawler.emails), len(crawler.phones), len(breached_emails))
-    return {
+    logger.info(
+        "Scan complete: %d emails, %d phones, %d breached emails",
+        len(crawler.emails),
+        len(crawler.phones),
+        len(breached_emails),
+    )
+    results = {
         "crawler": crawler,
         "subdomains": subdomains,
         "emails": set(crawler.emails.values()),
@@ -490,6 +503,9 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
         "email_sources": crawler.email_sources,
         "phone_sources": crawler.phone_sources,
     }
+
+    save_results(results)
+    return results
 
 
 # ---------------------- Main logic ----------------------
@@ -513,8 +529,6 @@ async def main():
     emails = results["emails"]
     phones = results["phones"]
     breached_emails = results["breached_emails"]
-
-    save_results(results)
 
     # ---- print summary to console ----
     print("\n--------- Summary ---------")

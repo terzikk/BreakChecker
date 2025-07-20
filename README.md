@@ -16,7 +16,7 @@ Two environment variables configure the crawler:
 
 - `HIBP_API_KEY` – HaveIBeenPwned API key.
 - `CRAWL_DEPTH` – maximum crawl depth (defaults to `3`).
-- `BREACH_LOG_FILE` – optional path to the log file (defaults to
+- `BREACH_LOG_FILE` – optional path to the rotating log file (defaults to
   `breach_checker.log`).
 
 When a `config.json` file exists in the repository root it overrides the
@@ -38,8 +38,10 @@ export HIBP_API_KEY=YOUR_HIBP_KEY
 # optional: export BREACH_LOG_FILE=/path/to/scan.log
 python breach_checker.py
 ```
-Follow the prompts to scan a domain and save results locally. The configuration
-can also be provided in `config.json` as shown above.
+Follow the prompts to scan a domain. Results are automatically written to
+`emails.txt`, `phones.txt`, `email_sources.txt`, `phone_sources.txt` and
+`breached_emails.txt`. The configuration can also be provided in `config.json`
+as shown above.
 
 ## Running the API server
 

@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 import os
-from breach_checker import scan_domain, save_results
+from breach_checker import scan_domain
 
 import logging
 
@@ -23,7 +23,6 @@ class ScanView(APIView):
             logging.info(
                 "SCAN: Starting scan for %s (depth=%s)", domain, depth)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-            save_results(results)
             logging.info("SCAN: Scan completed for %s", domain)
             logging.info(
                 "SCAN: emails=%d phones=%d breached=%d",

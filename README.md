@@ -78,12 +78,12 @@ The API will be available on `http://localhost:8000/`.
 
 ## Output files
 
-After a scan, three files are written in the current directory:
+After a scan, several files are written in the current directory:
 
-- `emails.txt` – each line contains an email and the URL where it was first
-  seen separated by a tab.
-- `phones.txt` – phone numbers paired with their source URL, also tab
-  separated.
+- `emails.txt` – list of discovered email addresses.
+- `email_sources.txt` – email addresses paired with the URL where they were first seen.
+- `phones.txt` – normalized phone numbers.
+- `phone_sources.txt` – phone numbers with their source URL.
 - `breached_emails.txt` – emails that were found in breaches.
 
 Debug logs record every discovery including a short snippet of the surrounding

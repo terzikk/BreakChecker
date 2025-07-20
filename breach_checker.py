@@ -30,6 +30,7 @@ import sys
 import json
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urljoin, urlparse
 from collections import deque
 import phonenumbers
@@ -42,27 +43,14 @@ import aiohttp
 from playwright.async_api import async_playwright
 
 LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
-    ],
-)
-
-logger = logging.getLogger(__name__)
-
-
-LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
-    ],
-)
+formatter = logging.Formatter(
+    "%(asctime)s %(levelname)s:%(name)s:%(message)s")
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=1_000_000, backupCount=3)
+stream_handler = logging.StreamHandler()
+for handler in (file_handler, stream_handler):
+    handler.setFormatter(formatter)
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
 
 logger = logging.getLogger(__name__)
 
@@ -164,34 +152,40 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
     emails: Set[str] = set()
     phones: Set[str] = set()
 
+    cmd = [
+        "katana",
+        "-u",
+        start_url,
+        "-d",
+        str(depth),
+        "-silent",
+        "-f",
+        "email,phone",
+        "-flc",
+        field_file,
+    ]
+
     try:
         logger.info("Running katana against %s", start_url)
-        result = subprocess.run(
-            [
-                "katana",
-                "-u",
-                start_url,
-                "-d",
-                str(depth),
-                "-silent",
-                "-f",
-                "email,phone",
-                "-flc",
-                field_file,
-            ],
-            capture_output=True,
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=60 * depth,
-            check=False,
         )
-        output = result.stdout
-        urls.update(URL_RE.findall(output))
-        for email in EMAIL_RE.findall(output):
-            emails.add(email.strip())
-        for phone in PHONE_RE.findall(output):
-            phones.add(phone.strip())
-        logger.debug("katana found %d urls, %d emails, %d phones",
-                     len(urls), len(emails), len(phones))
+        output_lines = []
+        for line in proc.stdout:
+            output_lines.append(line)
+            logger.info("[katana] %s", line.strip())
+            urls.update(URL_RE.findall(line))
+            for email in EMAIL_RE.findall(line):
+                emails.add(email.strip())
+            for phone in PHONE_RE.findall(line):
+                phones.add(phone.strip())
+        proc.wait(timeout=60 * depth)
+        logger.debug(
+            "katana found %d urls, %d emails, %d phones", len(urls), len(emails), len(phones)
+        )
     except Exception as exc:
         logger.warning("katana execution failed: %s", exc)
 
@@ -399,6 +393,35 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
         logger.warning("HIBP lookup failed for %s: %s", email, exc)
     return None
 
+
+def save_results(results: dict) -> None:
+    """Write emails, phones and their sources to output files."""
+    crawler = results.get("crawler")
+    emails = results.get("emails", set())
+    phones = results.get("phones", set())
+    email_sources = results.get("email_sources", {})
+    phone_sources = results.get("phone_sources", {})
+    breached_emails = results.get("breached_emails", {})
+
+    def write_list(filename: str, data):
+        with open(filename, "w", encoding="utf-8") as f:
+            for item in sorted(data):
+                f.write(str(item) + "\n")
+
+    def write_map(filename: str, values: dict[str, str], sources: dict[str, str]):
+        with open(filename, "w", encoding="utf-8") as f:
+            for canon, value in sorted(values.items()):
+                src = sources.get(canon, "")
+                f.write(f"{value}\t{src}\n")
+
+    if crawler:
+        write_map("email_sources.txt", crawler.emails, email_sources)
+        write_map("phone_sources.txt", crawler.phones, phone_sources)
+    write_list("emails.txt", emails)
+    write_list("phones.txt", phones)
+    write_list("breached_emails.txt", breached_emails.keys())
+    logger.info("Results written to output files")
+
 # ---------------------- High level scan function ----------------------
 
 
@@ -490,24 +513,8 @@ async def main():
     emails = results["emails"]
     phones = results["phones"]
     breached_emails = results["breached_emails"]
-    crawler = results["crawler"]
-    # ---- write results to files ----
 
-    def save_map(filename: str, values: dict[str, str], sources: dict[str, str]):
-        with open(filename, "w", encoding="utf-8") as f:
-            for canon, value in sorted(values.items()):
-                src = sources.get(canon, "")
-                f.write(f"{value}\t{src}\n")
-
-    def save_set(filename: str, data: Set[str]):
-        with open(filename, "w", encoding="utf-8") as f:
-            for item in sorted(data):
-                f.write(item + "\n")
-
-    save_map("emails.txt", crawler.emails, crawler.email_sources)
-    save_map("phones.txt", crawler.phones, crawler.phone_sources)
-    save_set("breached_emails.txt", set(breached_emails.keys()))
-    logger.info("Results written to output files")
+    save_results(results)
 
     # ---- print summary to console ----
     print("\n--------- Summary ---------")
@@ -529,6 +536,4 @@ async def main():
 
 # Run when executed directly
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(levelname)s:%(name)s:%(message)s")
-    results = asyncio.run(main())
+    asyncio.run(main())

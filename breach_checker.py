@@ -54,6 +54,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
+)
+
+logger = logging.getLogger(__name__)
+
+
 # Standard library modules provide URL handling and queues while
 # requests/BeautifulSoup handle HTTP fetching and parsing. "subprocess" is
 # used to call external enumeration tools when available.
@@ -282,14 +295,17 @@ class Crawler:
             self.email_sources[canon] = source
         logger.debug("Email %s found at %s | %s", email, source, snippet)
 
+
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
         """Store phone in normalized form if valid and not already seen."""
         norm = normalize_phone(phone)
+
         if norm:
             if norm not in self.phones:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
             logger.debug("Phone %s found at %s | %s", norm, source, snippet)
+
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -513,4 +529,6 @@ async def main():
 
 # Run when executed directly
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(levelname)s:%(name)s:%(message)s")
     results = asyncio.run(main())

@@ -121,11 +121,10 @@ def choose_scheme(host: str) -> str:
 
 
 def gather_with_katana(start_url: str, depth: int, field_file: str):
-    """Run katana and parse its output for URLs and data."""
+    """Run katana in headless mode and return discovered emails and phones."""
     if not shutil.which("katana"):
-        return set(), set(), set()
+        return set(), set()
 
-    urls: Set[str] = set()
     emails: Set[str] = set()
     phones: Set[str] = set()
 
@@ -138,6 +137,7 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
                 "-d",
                 str(depth),
                 "-silent",
+                "-hl",
                 "-f",
                 "email,phone",
                 "-flc",
@@ -149,7 +149,6 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
             check=False,
         )
         output = result.stdout
-        urls.update(URL_RE.findall(output))
         for email in EMAIL_RE.findall(output):
             emails.add(email.strip())
         for phone in PHONE_RE.findall(output):
@@ -157,7 +156,7 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
     except Exception:
         pass
 
-    return urls, emails, phones
+    return emails, phones
 
 
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
@@ -351,42 +350,34 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     use_katana = shutil.which("katana") is not None
     field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
 
-    if use_katana and verbose:
-        print("Using katana for deep enumeration")
+    if not use_katana:
+        raise RuntimeError("katana binary not found in PATH")
 
-    crawler = Crawler(domain, max_depth=0 if use_katana else depth)
+    if verbose:
+        print("Using katana for crawling")
+
+    emails: Set[str] = set()
+    phones: Set[str] = set()
 
     for sub in subdomains:
         scheme = choose_scheme(sub)
         start_url = f"{scheme}://{sub}"
         if verbose:
-            print(f"\nCrawling {start_url} ...")
-        if use_katana:
-            urls, emails, phones = gather_with_katana(
-                start_url, depth, field_file)
-            for e in emails:
-                crawler.add_email(e)
-            for p in phones:
-                crawler.add_phone(p)
-            if not urls:
-                urls = {start_url}
-            for link in urls:
-                await crawler.crawl(link)
-        else:
-            await crawler.crawl(start_url)
+            print(f"\nScanning {start_url} ...")
+        kat_emails, kat_phones = gather_with_katana(start_url, depth, field_file)
+        emails.update(kat_emails)
+        phones.update(kat_phones)
 
-    breached_emails = {}
-    for email in crawler.emails.values():
+    breached_emails: dict[str, List[str]] = {}
+    for email in emails:
         breaches = check_hibp(email, hibp_key)
         if breaches:
             breached_emails[email] = breaches
 
-    # Expose the collected data directly for easier consumption by callers.
     return {
-        "crawler": crawler,
         "subdomains": subdomains,
-        "emails": set(crawler.emails.values()),
-        "phones": set(crawler.phones.values()),
+        "emails": emails,
+        "phones": phones,
         "breached_emails": breached_emails,
     }
 

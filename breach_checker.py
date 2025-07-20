@@ -38,6 +38,8 @@ import shutil
 import subprocess
 from typing import Set, List, Optional
 import aiohttp
+from playwright.async_api import async_playwright
+
 
 # Standard library modules provide URL handling and queues while
 # requests/BeautifulSoup handle HTTP fetching and parsing. "subprocess" is
@@ -160,19 +162,19 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
     return urls, emails, phones
 
 
-async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Fetch a URL and return text content for HTML, JS or plain text pages."""
+async def fetch_url(session, url: str) -> Optional[str]:
+    """Fetch a URL using Playwright (for JavaScript-rendered content)."""
     try:
-        async with session.get(url, timeout=10, allow_redirects=True) as resp:
-            if resp.status == 200 and any(
-                resp.headers.get("content-type", "").startswith(t)
-                for t in ["text/html", "text/plain", "application/javascript"]
-            ):
-                return await resp.text()
-    except Exception:
-        # Network errors are ignored to keep crawling resilient
-        pass
-    return None
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, timeout=20000)
+            content = await page.content()
+            await browser.close()
+            return content
+    except Exception as e:
+        print(f"[💥] Playwright error at {url}: {e}")
+        return None
 
 
 # Regular expressions used during scraping

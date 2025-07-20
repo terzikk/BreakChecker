@@ -16,6 +16,8 @@ Two environment variables configure the crawler:
 
 - `HIBP_API_KEY` – HaveIBeenPwned API key.
 - `CRAWL_DEPTH` – maximum crawl depth (defaults to `3`).
+- `BREACH_LOG_FILE` – optional path to the log file (defaults to
+  `breach_checker.log`).
 
 When a `config.json` file exists in the repository root it overrides the
 environment variables. The file should contain:
@@ -33,6 +35,7 @@ environment variables. The file should contain:
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
 # optional: export CRAWL_DEPTH=2
+# optional: export BREACH_LOG_FILE=/path/to/scan.log
 python breach_checker.py
 ```
 Follow the prompts to scan a domain and save results locally. The configuration
@@ -46,6 +49,7 @@ Use Django's built-in server for testing. The server reads `HIBP_API_KEY` and
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
 # optional: export CRAWL_DEPTH=2
+# optional: export BREACH_LOG_FILE=/path/to/scan.log
 python manage.py runserver
 ```
 
@@ -66,6 +70,7 @@ stack:
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
 # optional: export CRAWL_DEPTH=2
+# optional: export BREACH_LOG_FILE=/path/to/scan.log
 docker-compose up --build
 ```
 

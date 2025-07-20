@@ -41,6 +41,17 @@ from typing import Set, List, Optional
 import aiohttp
 from playwright.async_api import async_playwright
 
+
+LOG_FILE = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -293,6 +304,7 @@ class Crawler:
                     await asyncio.gather(*tasks)
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
+        logger.info("Crawling %s", url)
         logger.debug("Processing %s", url)
         content = await fetch_url(session, url)
         if not content:

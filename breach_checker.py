@@ -551,4 +551,4 @@ async def main():
 
 # Run when executed directly
 if __name__ == "__main__":
-    asyncio.run(main())
+    results = asyncio.run(main())

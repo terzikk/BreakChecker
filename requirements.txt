@@ -5,3 +5,4 @@ django~=4.2
 djangorestframework~=3.14
 gunicorn~=21.2
 phonenumbers~=8.13
+playwright~=1.44

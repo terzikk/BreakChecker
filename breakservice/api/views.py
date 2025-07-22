@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 import os
-from breach_checker import scan_domain
+from breach_checker import scan_domain, load_config
 
 import logging
 
@@ -17,9 +17,11 @@ class ScanView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         try:
+            cfg = load_config()
             depth = int(request.data.get(
-                "depth", os.environ.get("CRAWL_DEPTH", 3)))
-            hibp_key = os.environ.get("HIBP_API_KEY")
+                "depth", os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3))))
+            hibp_key = os.environ.get(
+                "HIBP_API_KEY") or cfg.get("hibp_api_key")
             logging.info(
                 "SCAN: Starting scan for %s (depth=%s)", domain, depth)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key)

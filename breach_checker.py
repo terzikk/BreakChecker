@@ -378,28 +378,32 @@ class Crawler:
 # ---------------------- Breach checkers ----------------------
 
 def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
-    """Return list of breaches for an email using HaveIBeenPwned."""
+    """
+    Return list of breaches for an email using a HaveIBeenPwned proxy API.
+    """
     if not api_key:
         return None
-    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
+
+    url = f"http://83.212.80.246:8600/proxy/haveibeenpwned/{email}/"
     headers = {
-        "hibp-api-key": api_key,
-        "user-agent": "DomainCrawler/1.0",
+        "Accept": "application/json",
+        "Authorization": f"Api-Key {api_key}"
     }
     try:
-        logger.debug("Checking HIBP for %s", email)
-        resp = requests.get(
-            url, headers=headers, params={"truncateResponse": "false"}, timeout=10
-        )
+        logger.debug("Checking HIBP proxy for %s", email)
+        resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
+            # Assume the proxy returns a JSON list of breach objects
             breaches = [b.get("Name") for b in resp.json()]
             logger.debug("%s found in %d breaches", email, len(breaches))
             return breaches
         if resp.status_code == 404:
-            logger.debug("%s not found in HIBP", email)
+            logger.debug("%s not found in HIBP (proxy)", email)
             return []
+        logger.warning("Unexpected HIBP proxy response: %s %s",
+                       resp.status_code, resp.text)
     except Exception as exc:
-        logger.warning("HIBP lookup failed for %s: %s", email, exc)
+        logger.warning("HIBP proxy lookup failed for %s: %s", email, exc)
     return None
 
 
@@ -482,7 +486,10 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             await crawler.crawl(start_url)
 
     breached_emails = {}
+    logger.info("Preparing to check %d emails with HIBP", len(crawler.emails))
+    logger.info("HIBP API key: %s", hibp_key if hibp_key else "None")
     for email in crawler.emails.values():
+        logger.info("Calling check_hibp for: %s", email)
         breaches = check_hibp(email, hibp_key)
         if breaches:
             breached_emails[email] = breaches

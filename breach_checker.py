@@ -157,8 +157,8 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         return set(), set(), set()
 
     urls: Set[str] = set()
-    emails: Set[str] = set()
-    phones: Set[str] = set()
+    email_hits: list[tuple[str, str]] = []  # (email, endpoint)
+    phone_hits: list[tuple[str, str]] = []  # (phone, endpoint)
 
     cmd = [
         "katana",
@@ -182,24 +182,32 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
             text=True,
         )
         for line in proc.stdout:
-            for u in URL_RE.findall(line):
+            endpoint = start_url
+            text = line
+            try:
+                data = json.loads(line)
+                endpoint = data.get("request", {}).get("endpoint", start_url)
+                text = json.dumps(data)
+            except json.JSONDecodeError:
+                pass
+            for u in URL_RE.findall(text):
                 urls.add(u)
                 logger.info("katana crawling %s", u)
-            for email in EMAIL_RE.findall(line):
-                emails.add(email.strip())
-                logger.info("katana found email %s", email.strip())
-            for phone in PHONE_RE.findall(line):
-                phones.add(phone.strip())
-                logger.info("katana found phone %s", phone.strip())
+            for email in EMAIL_RE.findall(text):
+                email_hits.append((email.strip(), endpoint))
+                logger.info("katana found email %s at %s", email.strip(), endpoint)
+            for phone in PHONE_RE.findall(text):
+                phone_hits.append((phone.strip(), endpoint))
+                logger.info("katana reported candidate phone %s at %s", phone.strip(), endpoint)
         proc.wait(timeout=60 * depth)
         logger.debug(
             "katana found %d urls, %d emails, %d phones", len(
-                urls), len(emails), len(phones)
+                urls), len(email_hits), len(phone_hits)
         )
     except Exception as exc:
         logger.warning("katana execution failed: %s", exc)
 
-    return urls, emails, phones
+    return urls, email_hits, phone_hits
 
 
 async def fetch_url(session, url: str) -> Optional[str]:
@@ -472,12 +480,12 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             print(f"\nCrawling {start_url} ...")
         logger.info("Crawling %s", start_url)
         if use_katana:
-            urls, emails, phones = gather_with_katana(
+            urls, email_hits, phone_hits = gather_with_katana(
                 start_url, depth, field_file)
-            for e in emails:
-                crawler.add_email(e, start_url, "katana")
-            for p in phones:
-                crawler.add_phone(p, start_url, "katana")
+            for e, src in email_hits:
+                crawler.add_email(e, src, "katana")
+            for p, src in phone_hits:
+                crawler.add_phone(p, src, "katana")
             if not urls:
                 urls = {start_url}
             for link in urls:

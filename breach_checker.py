@@ -152,13 +152,13 @@ def choose_scheme(host: str) -> str:
 
 
 def gather_with_katana(start_url: str, depth: int, field_file: str):
-    """Run katana and parse its output for URLs and data."""
+    """Run katana and parse its JSON output for URLs and data."""
     if not shutil.which("katana"):
-        return set(), set(), set()
+        return set(), {}, {}
 
     urls: Set[str] = set()
-    emails: Set[str] = set()
-    phones: Set[str] = set()
+    email_map: dict[str, str] = {}
+    phone_map: dict[str, str] = {}
 
     cmd = [
         "katana",
@@ -167,6 +167,7 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         "-d",
         str(depth),
         "-silent",
+        "-j",
         "-f",
         "email,phone",
         "-flc",
@@ -182,24 +183,46 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
             text=True,
         )
         for line in proc.stdout:
-            for u in URL_RE.findall(line):
-                urls.add(u)
-                logger.info("katana crawling %s", u)
+            endpoint = None
+            try:
+                data = json.loads(line)
+                endpoint = (
+                    data.get("url")
+                    or data.get("endpoint")
+                    or data.get("request", {}).get("endpoint")
+                )
+            except json.JSONDecodeError:
+                data = None
+            if endpoint:
+                urls.add(endpoint)
+                logger.info("katana crawling %s", endpoint)
             for email in EMAIL_RE.findall(line):
-                emails.add(email.strip())
-                logger.info("katana found email %s", email.strip())
+                if email not in email_map:
+                    email_map[email] = endpoint or start_url
+                logger.info(
+                    "katana found email %s at %s",
+                    email.strip(),
+                    endpoint or start_url,
+                )
             for phone in PHONE_RE.findall(line):
-                phones.add(phone.strip())
-                logger.info("katana found phone %s", phone.strip())
+                if phone not in phone_map:
+                    phone_map[phone] = endpoint or start_url
+                logger.info(
+                    "katana candidate phone %s at %s",
+                    phone.strip(),
+                    endpoint or start_url,
+                )
         proc.wait(timeout=60 * depth)
         logger.debug(
-            "katana found %d urls, %d emails, %d phones", len(
-                urls), len(emails), len(phones)
+            "katana found %d urls, %d emails, %d phones",
+            len(urls),
+            len(email_map),
+            len(phone_map),
         )
     except Exception as exc:
         logger.warning("katana execution failed: %s", exc)
 
-    return urls, emails, phones
+    return urls, email_map, phone_map
 
 
 async def fetch_url(session, url: str) -> Optional[str]:
@@ -472,12 +495,12 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             print(f"\nCrawling {start_url} ...")
         logger.info("Crawling %s", start_url)
         if use_katana:
-            urls, emails, phones = gather_with_katana(
+            urls, email_map, phone_map = gather_with_katana(
                 start_url, depth, field_file)
-            for e in emails:
-                crawler.add_email(e, start_url, "katana")
-            for p in phones:
-                crawler.add_phone(p, start_url, "katana")
+            for e, src in email_map.items():
+                crawler.add_email(e, src, "katana")
+            for p, src in phone_map.items():
+                crawler.add_phone(p, src, "katana")
             if not urls:
                 urls = {start_url}
             for link in urls:

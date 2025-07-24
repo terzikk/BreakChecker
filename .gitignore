@@ -3,3 +3,4 @@ __pycache__/
 emails.txt
 phones.txt
 breached_emails.txt
+config.json

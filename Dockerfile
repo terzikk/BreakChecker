@@ -36,4 +36,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["gunicorn", "breakservice.wsgi:application", "--bind", "0.0.0.0:8000", "--timeout", "1200"]
+CMD ["gunicorn", "breakservice.wsgi:application", "--bind", "0.0.0.0:8000", "--timeout", "1000000000"]

@@ -108,7 +108,7 @@ def enumerate_subdomains(domain: str) -> Set[str]:
             ], capture_output=True, text=True, check=False, timeout=60)
             subs.update(line.strip()
                         for line in result.stdout.splitlines() if line.strip())
-            logger.info("subfinder returned %d subdomains", len(subs))
+            logger.debug("subfinder returned %d subdomains", len(subs))
         except Exception as exc:
             # Ignore failures and fall back to web-based enumeration
             logger.info("subfinder failed: %s", exc)
@@ -127,12 +127,13 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                             sub = sub.lstrip('*.')
                         if sub and sub.endswith(domain):
                             subs.add(sub)
-                logger.info("crt.sh returned %d subdomains", len(subs))
+                logger.debug("crt.sh returned %d subdomains", len(subs))
         except Exception as exc:
             # Any network/JSON error simply results in returning the main domain
             logger.debug("crt.sh lookup failed: %s", exc)
     # Always include main domain
     subs.add(domain)
+    logger.info("Found %d subdomains for %s", len(subs), domain)
     return subs
 
 
@@ -163,7 +164,7 @@ def filter_accessible_subdomains(subdomains: Set[str]) -> Dict[str, str]:
         else:
             logger.debug("Removing unreachable subdomain: %s", host)
 
-    logger.info("%d out of %d subdomains are accessible",
+    logger.info("Accessible subdomains: %d of %d",
                 len(live), len(subdomains))
     return live
 
@@ -251,7 +252,7 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
 async def fetch_url(session, url: str) -> Optional[str]:
     """Fetch a URL using Playwright (for JavaScript-rendered content)."""
     try:
-        logger.info("Fetching %s", url)
+        logger.debug("Fetching %s", url)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -358,7 +359,7 @@ class Crawler:
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
-        logger.info("Starting crawl at %s", start_url)
+        logger.debug("Starting crawl at %s", start_url)
         queue = deque([(start_url, 0)])
         async with aiohttp.ClientSession() as session:
             while queue:
@@ -375,7 +376,6 @@ class Crawler:
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
         logger.info("Crawling %s", url)
-        logger.debug("Processing %s", url)
         content = await fetch_url(session, url)
         if not content:
             return

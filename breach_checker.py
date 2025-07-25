@@ -38,7 +38,7 @@ import requests
 from bs4 import BeautifulSoup
 import shutil
 import subprocess
-from typing import Set, List, Optional
+from typing import Set, List, Optional, Dict
 import aiohttp
 from playwright.async_api import async_playwright
 
@@ -136,20 +136,36 @@ def enumerate_subdomains(domain: str) -> Set[str]:
     return subs
 
 
-def choose_scheme(host: str) -> str:
-    """Return 'https' if the host appears reachable via HTTPS, else 'http'."""
+def choose_scheme(host: str) -> Optional[str]:
+    """Return the reachable scheme for *host* or ``None`` if unreachable."""
     for scheme in ("https", "http"):
         try:
-            resp = requests.head(f"{scheme}://{host}",
-                                 timeout=5, allow_redirects=True)
+            resp = requests.head(
+                f"{scheme}://{host}", timeout=5, allow_redirects=True
+            )
             if resp.status_code < 400:
                 logger.debug("%s is reachable via %s", host, scheme)
                 return scheme
         except Exception as exc:
             logger.debug("Error checking %s via %s: %s", host, scheme, exc)
             continue
-    logger.debug("Defaulting to http for %s", host)
-    return "http"
+    logger.debug("%s is not reachable via HTTP or HTTPS", host)
+    return None
+
+
+def filter_accessible_subdomains(subdomains: Set[str]) -> Dict[str, str]:
+    """Return mapping of reachable subdomains to their scheme."""
+    live: Dict[str, str] = {}
+    for host in subdomains:
+        scheme = choose_scheme(host)
+        if scheme:
+            live[host] = scheme
+        else:
+            logger.debug("Removing unreachable subdomain: %s", host)
+
+    logger.info("%d out of %d subdomains are accessible",
+                len(live), len(subdomains))
+    return live
 
 
 def gather_with_katana(start_url: str, depth: int, field_file: str):
@@ -371,9 +387,10 @@ class Crawler:
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href.lower().startswith("mailto:"):
-                addr = href.split(":", 1)[1].split("?", 1)[0]
-                snippet = f"mailto:{addr}"
-                self.add_email(addr, url, snippet)
+                addr = href.split(":", 1)[1].split("?", 1)[0].strip()
+                if addr:
+                    snippet = f"mailto:{addr}"
+                    self.add_email(addr, url, snippet)
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)
@@ -480,9 +497,11 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     if verbose:
         print(f"Enumerating subdomains for {domain}...")
     logger.info("Scanning domain %s at depth %d", domain, depth)
-    subdomains = enumerate_subdomains(domain)
+    subs = enumerate_subdomains(domain)
+    subdomain_schemes = filter_accessible_subdomains(subs)
     if verbose:
-        for sub in sorted(subdomains):
+        print(f"{len(subdomain_schemes)} out of {len(subs)} subdomains are accessible")
+        for sub in sorted(subdomain_schemes):
             print(f" [+] {sub}")
 
     use_katana = shutil.which("katana") is not None
@@ -497,7 +516,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
 
     crawler = Crawler(domain, max_depth=0 if use_katana else depth)
 
-    for sub in subdomains:
+    for sub, scheme in subdomain_schemes.items():
         scheme = choose_scheme(sub)
         start_url = f"{scheme}://{sub}"
         if verbose:
@@ -534,7 +553,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     )
     results = {
         "crawler": crawler,
-        "subdomains": subdomains,
+        "subdomains": set(subdomain_schemes.keys()),
         "emails": set(crawler.emails.values()),
         "phones": set(crawler.phones.values()),
         "breached_emails": breached_emails,
@@ -589,4 +608,4 @@ async def main():
 
 # Run when executed directly
 if __name__ == "__main__":
-    results = asyncio.run(main())
+    asyncio.run(main())

@@ -11,10 +11,8 @@ loaded from ``config.json`` if present, falling back to environment variables:
 
 Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
 ``crawl_depth`` to avoid setting environment variables each run. If the
-``katana`` command is available it will be used for deeper crawling with the
-regex rules from ``field-config.yaml``; its output is scanned for emails and
-phone numbers as well as additional URLs before pages are processed by this
-script.
+``katana`` command is available it will be used for deeper crawling. Katana
+collects additional URLs which are then processed by this script.
 """
 
 # This script gathers subdomains for a target domain, crawls each host for
@@ -169,14 +167,12 @@ def filter_accessible_subdomains(subdomains: Set[str]) -> Dict[str, str]:
     return live
 
 
-def gather_with_katana(start_url: str, depth: int, field_file: str):
-    """Run katana and parse its JSON output for URLs and data."""
+def gather_with_katana(start_url: str, depth: int) -> Set[str]:
+    """Run katana and return discovered URLs only."""
     if not shutil.which("katana"):
-        return set(), {}, {}
+        return set()
 
     urls: Set[str] = set()
-    email_sources: dict[str, str] = {}
-    phone_sources: dict[str, str] = {}
 
     cmd = [
         "katana",
@@ -186,10 +182,6 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         str(depth),
         "-silent",
         "-j",
-        "-f",
-        "email,phone",
-        "-flc",
-        field_file,
     ]
 
     try:
@@ -219,34 +211,12 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
                 urls.add(endpoint)
                 logger.info("katana scanned %s", endpoint)
 
-            fields = data.get("fields") or {}
-            emails = fields.get("email") or data.get("email") or []
-            if isinstance(emails, str):
-                emails = [emails]
-            for email in emails:
-                canon = normalize_email(email)
-                if canon not in email_sources:
-                    email_sources[canon] = endpoint
-                    logger.info("katana found email %s at %s", email, endpoint)
-
-            phones = fields.get("phone") or data.get("phone") or []
-            if isinstance(phones, str):
-                phones = [phones]
-            for phone in phones:
-                norm = normalize_phone(phone)
-                if norm and norm not in phone_sources:
-                    phone_sources[norm] = endpoint
-                    logger.info("katana found phone %s at %s", norm, endpoint)
-
         proc.wait(timeout=60 * depth)
-        logger.debug(
-            "katana found %d urls, %d emails, %d phones", len(urls),
-            len(email_sources), len(phone_sources)
-        )
+        logger.debug("katana found %d urls", len(urls))
     except Exception as exc:
         logger.warning("katana execution failed: %s", exc)
 
-    return urls, email_sources, phone_sources
+    return urls
 
 
 async def fetch_url(session, url: str) -> Optional[str]:
@@ -505,8 +475,6 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             print(f" [+] {sub}")
 
     use_katana = shutil.which("katana") is not None
-    field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
-
     if use_katana and verbose:
         print("Using katana for deep enumeration")
     if use_katana:
@@ -523,12 +491,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
             print(f"\nCrawling {start_url} ...")
         logger.info("Crawling %s", start_url)
         if use_katana:
-            urls, email_map, phone_map = gather_with_katana(
-                start_url, depth, field_file)
-            for e, src in email_map.items():
-                crawler.add_email(e, src, "katana")
-            for p, src in phone_map.items():
-                crawler.add_phone(p, src, "katana")
+            urls = gather_with_katana(start_url, depth)
             if not urls:
                 urls = {start_url}
             for link in urls:

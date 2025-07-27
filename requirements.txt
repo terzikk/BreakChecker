@@ -1,8 +1,9 @@
 requests~=2.31
 beautifulsoup4~=4.13
 aiohttp~=3.9
-django~=4.2
+django~=5.2.4
 djangorestframework~=3.14
-gunicorn~=21.2
+gunicorn~=23.0.0
 phonenumbers~=8.13
-playwright~=1.44
+playwright~=1.54.0
+email-validator~=2.1

@@ -1,7 +1,7 @@
 """Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 breach_checker.py
+  python3 break_checker.py
 
 The script prompts for the target domain. API credentials and crawl depth are
 loaded from ``config.json`` if present, falling back to environment variables:
@@ -11,10 +11,8 @@ loaded from ``config.json`` if present, falling back to environment variables:
 
 Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
 ``crawl_depth`` to avoid setting environment variables each run. If the
-``katana`` command is available it will be used for deeper crawling with the
-regex rules from ``field-config.yaml``; its output is scanned for emails and
-phone numbers as well as additional URLs before pages are processed by this
-script.
+``katana`` command is available it will be used for deeper and faster crawling. Katana
+collects additional URLs which are then processed by this script.
 """
 
 # This script gathers subdomains for a target domain, crawls each host for
@@ -38,25 +36,27 @@ import requests
 from bs4 import BeautifulSoup
 import shutil
 import subprocess
-from typing import Set, List, Optional
+from typing import Set, List, Optional, Dict
 import aiohttp
 from playwright.async_api import async_playwright
+from email_validator import validate_email, EmailNotValidError
 
 
 def configure_logging() -> logging.Logger:
-    """Configure root logging with rotation and console output."""
-    log_file = os.environ.get("BREACH_LOG_FILE", "breach_checker.log")
+    log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     root_logger = logging.getLogger()
-    if not root_logger.handlers:
-        formatter = logging.Formatter(
-            "%(asctime)s %(levelname)s:%(name)s:%(message)s")
-        file_handler = RotatingFileHandler(
-            log_file, maxBytes=1_000_000, backupCount=3)
-        stream_handler = logging.StreamHandler()
-        for handler in (file_handler, stream_handler):
-            handler.setFormatter(formatter)
-            root_logger.addHandler(handler)
-        root_logger.setLevel(logging.INFO)
+    # Remove all handlers before adding new ones to avoid duplicates
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s:%(name)s:%(message)s")
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=1_000_000, backupCount=3)
+    stream_handler = logging.StreamHandler()
+    for handler in (file_handler, stream_handler):
+        handler.setFormatter(formatter)
+        root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
     return logging.getLogger(__name__)
 
 
@@ -107,10 +107,10 @@ def enumerate_subdomains(domain: str) -> Set[str]:
             ], capture_output=True, text=True, check=False, timeout=60)
             subs.update(line.strip()
                         for line in result.stdout.splitlines() if line.strip())
-            logger.debug("subfinder returned %d results", len(subs))
+            logger.debug("subfinder returned %d subdomains", len(subs))
         except Exception as exc:
             # Ignore failures and fall back to web-based enumeration
-            logger.debug("subfinder failed: %s", exc)
+            logger.info("subfinder failed: %s", exc)
     # Fallback to crt.sh if none found
     if not subs:
         try:
@@ -126,39 +126,54 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                             sub = sub.lstrip('*.')
                         if sub and sub.endswith(domain):
                             subs.add(sub)
+                logger.debug("crt.sh returned %d subdomains", len(subs))
         except Exception as exc:
             # Any network/JSON error simply results in returning the main domain
             logger.debug("crt.sh lookup failed: %s", exc)
     # Always include main domain
     subs.add(domain)
-    logger.info("Found %d subdomains", len(subs))
+    logger.info("Found %d subdomains for %s", len(subs), domain)
     return subs
 
 
-def choose_scheme(host: str) -> str:
-    """Return 'https' if the host appears reachable via HTTPS, else 'http'."""
+def choose_scheme(host: str) -> Optional[str]:
+    """Return the reachable scheme for *host* or ``None`` if unreachable."""
     for scheme in ("https", "http"):
         try:
-            resp = requests.head(f"{scheme}://{host}",
-                                 timeout=5, allow_redirects=True)
+            resp = requests.head(
+                f"{scheme}://{host}", timeout=5, allow_redirects=True
+            )
             if resp.status_code < 400:
                 logger.debug("%s is reachable via %s", host, scheme)
                 return scheme
         except Exception as exc:
             logger.debug("Error checking %s via %s: %s", host, scheme, exc)
             continue
-    logger.debug("Defaulting to http for %s", host)
-    return "http"
+    logger.debug("%s is not reachable via HTTP or HTTPS", host)
+    return None
 
 
-def gather_with_katana(start_url: str, depth: int, field_file: str):
-    """Run katana and parse its output for URLs and data."""
+def filter_accessible_subdomains(subdomains: Set[str]) -> Dict[str, str]:
+    """Return mapping of reachable subdomains to their scheme."""
+    live: Dict[str, str] = {}
+    for host in subdomains:
+        scheme = choose_scheme(host)
+        if scheme:
+            live[host] = scheme
+        else:
+            logger.debug("Removing unreachable subdomain: %s", host)
+
+    logger.info("Accessible subdomains: %d of %d",
+                len(live), len(subdomains))
+    return live
+
+
+def gather_with_katana(start_url: str, depth: int) -> Set[str]:
+    """Run katana and return discovered URLs only."""
     if not shutil.which("katana"):
-        return set(), set(), set()
+        return set()
 
     urls: Set[str] = set()
-    emails: Set[str] = set()
-    phones: Set[str] = set()
 
     cmd = [
         "katana",
@@ -167,10 +182,7 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
         "-d",
         str(depth),
         "-silent",
-        "-f",
-        "email,phone",
-        "-flc",
-        field_file,
+        "-j",
     ]
 
     try:
@@ -182,30 +194,36 @@ def gather_with_katana(start_url: str, depth: int, field_file: str):
             text=True,
         )
         for line in proc.stdout:
-            for u in URL_RE.findall(line):
-                urls.add(u)
-                logger.info("katana crawling %s", u)
-            for email in EMAIL_RE.findall(line):
-                emails.add(email.strip())
-                logger.info("katana found email %s", email.strip())
-            for phone in PHONE_RE.findall(line):
-                phones.add(phone.strip())
-                logger.info("katana found phone %s", phone.strip())
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("katana non-json line: %s", line)
+                continue
+
+            endpoint = (
+                data.get("url")
+                or data.get("request", {}).get("endpoint")
+                or start_url
+            )
+            if endpoint not in urls:
+                urls.add(endpoint)
+                logger.info("katana scanned %s", endpoint)
+
         proc.wait(timeout=60 * depth)
-        logger.debug(
-            "katana found %d urls, %d emails, %d phones", len(
-                urls), len(emails), len(phones)
-        )
+        logger.debug("katana found %d urls", len(urls))
     except Exception as exc:
         logger.warning("katana execution failed: %s", exc)
 
-    return urls, emails, phones
+    return urls
 
 
 async def fetch_url(session, url: str) -> Optional[str]:
     """Fetch a URL using Playwright (for JavaScript-rendered content)."""
     try:
-        logger.info("Fetching %s", url)
+        logger.debug("Fetching %s", url)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -217,9 +235,6 @@ async def fetch_url(session, url: str) -> Optional[str]:
         logger.warning("Playwright error at %s: %s", url, e)
         return None
 
-
-# Regular expressions used during scraping
-URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 # Common file extensions that should not be treated as valid email TLDs.  These
 # often appear in asset paths like ``image@2x.png`` and can be misdetected as
 EMAIL_IGNORE_EXTS = (
@@ -254,9 +269,18 @@ EMAIL_RE = re.compile(
 PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
 
 
-def normalize_email(email: str) -> str:
-    """Return a canonical form of an email address for deduplication."""
-    return email.strip().lower()
+def normalize_email(email: str) -> Optional[str]:
+    """Validate and normalize an email address after regex extraction.
+
+    Using ``email-validator`` catches syntactic errors and domains that do
+    not exist, providing a second layer of validation for higher accuracy.
+    """
+    try:
+        valid = validate_email(email, check_deliverability=True)
+        return valid.normalized
+    except EmailNotValidError as exc:
+        logger.debug("Email validation failed for %s: %s", email, exc)
+        return None
 
 
 def normalize_phone(phone: str) -> Optional[str]:
@@ -294,10 +318,14 @@ class Crawler:
     def add_email(self, email: str, source: str, snippet: str = "") -> None:
         """Store email if not already seen (case-insensitive)."""
         canon = normalize_email(email)
+        if not canon:
+            return
         if canon not in self.emails:
-            self.emails[canon] = email.strip()
+            self.emails[canon] = canon
             self.email_sources[canon] = source
-        logger.info("Email %s found at %s | %s", email, source, snippet)
+        trimmed_snippet = " ".join(snippet.strip().split())
+        logger.info("Email %s found at %s | %s",
+                    canon, source, trimmed_snippet)
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
         """Store phone in normalized form if valid and not already seen."""
@@ -307,11 +335,13 @@ class Crawler:
             if norm not in self.phones:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
-            logger.info("Phone %s found at %s | %s", norm, source, snippet)
+            trimmed_snippet = " ".join(snippet.strip().split())
+            logger.info("Phone %s found at %s | %s",
+                        norm, source, trimmed_snippet)
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
-        logger.info("Starting crawl at %s", start_url)
+        logger.debug("Starting the inner crawler at %s", start_url)
         queue = deque([(start_url, 0)])
         async with aiohttp.ClientSession() as session:
             while queue:
@@ -328,7 +358,6 @@ class Crawler:
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
         logger.info("Crawling %s", url)
-        logger.debug("Processing %s", url)
         content = await fetch_url(session, url)
         if not content:
             return
@@ -340,8 +369,10 @@ class Crawler:
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href.lower().startswith("mailto:"):
-                addr = href.split(":", 1)[1].split("?", 1)[0]
-                self.add_email(addr, url, "mailto link")
+                addr = href.split(":", 1)[1].split("?", 1)[0].strip()
+                if addr:
+                    snippet = f"mailto:{addr}"
+                    self.add_email(addr, url, snippet)
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)
@@ -395,10 +426,10 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
         if resp.status_code == 200:
             # Assume the proxy returns a JSON list of breach objects
             breaches = [b.get("Name") for b in resp.json()]
-            logger.debug("%s found in %d breaches", email, len(breaches))
+            logger.info("%s found in %d breaches", email, len(breaches))
             return breaches
         if resp.status_code == 404:
-            logger.debug("%s not found in HIBP (proxy)", email)
+            logger.info("%s not found in HIBP (proxy)", email)
             return []
         logger.warning("Unexpected HIBP proxy response: %s %s",
                        resp.status_code, resp.text)
@@ -448,14 +479,14 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     if verbose:
         print(f"Enumerating subdomains for {domain}...")
     logger.info("Scanning domain %s at depth %d", domain, depth)
-    subdomains = enumerate_subdomains(domain)
+    subs = enumerate_subdomains(domain)
+    subdomain_schemes = filter_accessible_subdomains(subs)
     if verbose:
-        for sub in sorted(subdomains):
+        print(f"{len(subdomain_schemes)} out of {len(subs)} subdomains are accessible")
+        for sub in sorted(subdomain_schemes):
             print(f" [+] {sub}")
 
     use_katana = shutil.which("katana") is not None
-    field_file = os.path.join(os.path.dirname(__file__), "field-config.yaml")
-
     if use_katana and verbose:
         print("Using katana for deep enumeration")
     if use_katana:
@@ -465,19 +496,14 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
 
     crawler = Crawler(domain, max_depth=0 if use_katana else depth)
 
-    for sub in subdomains:
+    for sub, scheme in subdomain_schemes.items():
         scheme = choose_scheme(sub)
         start_url = f"{scheme}://{sub}"
         if verbose:
             print(f"\nCrawling {start_url} ...")
-        logger.info("Crawling %s", start_url)
+        logger.info("Starting to crawl %s", start_url)
         if use_katana:
-            urls, emails, phones = gather_with_katana(
-                start_url, depth, field_file)
-            for e in emails:
-                crawler.add_email(e, start_url, "katana")
-            for p in phones:
-                crawler.add_phone(p, start_url, "katana")
+            urls = gather_with_katana(start_url, depth)
             if not urls:
                 urls = {start_url}
             for link in urls:
@@ -487,7 +513,6 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
 
     breached_emails = {}
     logger.info("Preparing to check %d emails with HIBP", len(crawler.emails))
-    logger.info("HIBP API key: %s", hibp_key if hibp_key else "None")
     for email in crawler.emails.values():
         logger.info("Calling check_hibp for: %s", email)
         breaches = check_hibp(email, hibp_key)
@@ -503,7 +528,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     )
     results = {
         "crawler": crawler,
-        "subdomains": subdomains,
+        "subdomains": set(subdomain_schemes.keys()),
         "emails": set(crawler.emails.values()),
         "phones": set(crawler.phones.values()),
         "breached_emails": breached_emails,
@@ -558,4 +583,4 @@ async def main():
 
 # Run when executed directly
 if __name__ == "__main__":
-    results = asyncio.run(main())
+    asyncio.run(main())

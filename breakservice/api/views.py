@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 import os
-from breach_checker import scan_domain, load_config
+from break_checker import scan_domain, load_config
 
 import logging
 

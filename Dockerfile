@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -10,12 +10,12 @@ RUN apt-get update && \
     libxext6 libxi6 libxcb1 libx11-6 libdrm2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Katana (v1.1.3, Linux amd64)
-RUN wget -q https://github.com/projectdiscovery/katana/releases/download/v1.1.3/katana_1.1.3_linux_amd64.zip \
-    && unzip katana_1.1.3_linux_amd64.zip \
+# Install Katana (v1.2.1, Linux amd64)
+RUN wget -q https://github.com/projectdiscovery/katana/releases/download/v1.2.1/katana_1.2.1_linux_amd64.zip \
+    && unzip katana_1.2.1_linux_amd64.zip \
     && mv katana /usr/local/bin/katana \
     && chmod +x /usr/local/bin/katana \
-    && rm katana_1.1.3_linux_amd64.zip
+    && rm katana_1.2.1_linux_amd64.zip
 
 # Install Subfinder (v2.8.0, Linux amd64)
 RUN wget -q https://github.com/projectdiscovery/subfinder/releases/download/v2.8.0/subfinder_2.8.0_linux_amd64.zip \

@@ -284,13 +284,15 @@ def normalize_email(email: str) -> Optional[str]:
 
 
 def normalize_phone(phone: str) -> Optional[str]:
-    """Return the phone number in E.164 format if it appears valid."""
+    """Return the phone number in local format if it appears valid."""
     try:
         parsed = phonenumbers.parse(phone, None)
         if phonenumbers.is_valid_number(parsed):
-            return phonenumbers.format_number(
-                parsed, phonenumbers.PhoneNumberFormat.E164
-            )
+            # Get the national significant number without spaces
+            local = phonenumbers.format_number(
+                parsed, phonenumbers.PhoneNumberFormat.NATIONAL)
+            digits_only = ''.join(filter(str.isdigit, local))
+            return digits_only
     except phonenumbers.NumberParseException:
         pass
     return None

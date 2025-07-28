@@ -1,7 +1,7 @@
 """Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 break_checker.py <domain> [--depth N] [--hibp-key KEY] [--verbose] [--json]
+  python3 break_checker.py <domain> [--depth N] [--verbose] [--json]
 
 The script reads API credentials and crawl depth from ``config.json`` if
 present, falling back to environment variables:
@@ -490,26 +490,40 @@ def save_results(results: dict, *, as_json: bool = False) -> None:
 # ---------------------- High level scan function ----------------------
 
 
-async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False, save_json: bool = False) -> dict:
+async def scan_domain(
+    domain: str,
+    depth: int = 3,
+    hibp_key: Optional[str] = None,
+    *,
+    verbose: bool = False,
+    save_json: bool = False,
+    interactive: bool = False,
+) -> dict:
     """Crawl a domain and optionally check emails against HIBP.
 
     The returned dictionary now exposes the discovered subdomains, emails and
     phone numbers directly so callers like the microservice can easily
     serialize the data as JSON.
     """
-    if verbose:
+    if interactive:
         print(f"Enumerating subdomains for {domain}...")
     logger.info("Scanning domain %s at depth %d", domain, depth)
     subs = enumerate_subdomains(domain)
     subdomain_schemes = filter_accessible_subdomains(subs)
-    if verbose:
-        print(f"{len(subdomain_schemes)} out of {len(subs)} subdomains are accessible")
-        for sub in sorted(subdomain_schemes):
-            print(f" [+] {sub}")
+    if interactive:
+        if verbose:
+            print(f"{len(subdomain_schemes)} out of {len(subs)} subdomains are accessible")
+            for sub in sorted(subdomain_schemes):
+                print(f" [+] {sub}")
+        else:
+            print(f"Found {len(subdomain_schemes)} accessible subdomains")
 
     use_katana = shutil.which("katana") is not None
-    if use_katana and verbose:
-        print("Using katana for deep enumeration")
+    if use_katana and interactive:
+        if verbose:
+            print("Using katana for deep enumeration")
+        else:
+            print("Using katana for enumeration")
     if use_katana:
         logger.info("katana available; using for enumeration")
     else:
@@ -520,7 +534,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     for sub, scheme in subdomain_schemes.items():
         scheme = choose_scheme(sub)
         start_url = f"{scheme}://{sub}"
-        if verbose:
+        if interactive:
             print(f"\nCrawling {start_url} ...")
         logger.info("Starting to crawl %s", start_url)
         if use_katana:
@@ -569,7 +583,6 @@ async def main():
         description="Domain crawler, subdomain enumerator and breach checker")
     parser.add_argument("domain", help="Target domain to scan")
     parser.add_argument("--depth", type=int, help="Maximum crawl depth")
-    parser.add_argument("--hibp-key", help="HIBP API key")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose output")
     parser.add_argument("--json", action="store_true",
@@ -592,8 +605,7 @@ async def main():
     cfg = load_config()
     depth = args.depth if args.depth is not None else int(
         os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
-    hibp_key = args.hibp_key or os.environ.get("HIBP_API_KEY") or cfg.get(
-        "hibp_api_key")
+    hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
     logger.debug("Using crawl depth %d", depth)
 
     results = await scan_domain(
@@ -602,6 +614,7 @@ async def main():
         hibp_key,
         verbose=args.verbose,
         save_json=args.json,
+        interactive=True,
     )
     subdomains = results["subdomains"]
     emails = results["emails"]

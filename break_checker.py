@@ -1,13 +1,16 @@
 """Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 break_checker.py <domain> [--depth N] [--hibp-key KEY] [--verbose]
+  python3 break_checker.py <domain> [--depth N] [--hibp-key KEY] [--verbose] [--json]
 
 The script reads API credentials and crawl depth from ``config.json`` if
 present, falling back to environment variables:
 
   HIBP_API_KEY   - HaveIBeenPwned API key
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
+
+Pass ``--json`` to also save ``results.json`` and ``--verbose`` to show
+detailed logging output.
 
 Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
 ``crawl_depth`` to avoid setting environment variables each run. If the
@@ -441,8 +444,12 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
-def save_results(results: dict) -> None:
-    """Write emails, phones and their sources to output files."""
+def save_results(results: dict, *, as_json: bool = False) -> None:
+    """Write emails, phones and their sources to output files.
+
+    When ``as_json`` is ``True`` the consolidated data is also written to
+    ``results.json`` for easier machine consumption.
+    """
     crawler = results.get("crawler")
     emails = results.get("emails", set())
     phones = results.get("phones", set())
@@ -467,12 +474,23 @@ def save_results(results: dict) -> None:
     write_list("emails.txt", emails)
     write_list("phones.txt", phones)
     write_list("breached_emails.txt", breached_emails.keys())
+    if as_json:
+        json_data = {
+            "subdomains": sorted(results.get("subdomains", [])),
+            "emails": sorted(emails),
+            "phones": sorted(phones),
+            "breached_emails": breached_emails,
+            "email_sources": email_sources,
+            "phone_sources": phone_sources,
+        }
+        with open("results.json", "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2)
     logger.info("Results written to output files")
 
 # ---------------------- High level scan function ----------------------
 
 
-async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False) -> dict:
+async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False, save_json: bool = False) -> dict:
     """Crawl a domain and optionally check emails against HIBP.
 
     The returned dictionary now exposes the discovered subdomains, emails and
@@ -539,7 +557,7 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
         "phone_sources": crawler.phone_sources,
     }
 
-    save_results(results)
+    save_results(results, as_json=save_json)
     return results
 
 
@@ -554,7 +572,21 @@ async def main():
     parser.add_argument("--hibp-key", help="HIBP API key")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose output")
+    parser.add_argument("--json", action="store_true",
+                        help="Also save consolidated results.json")
     args = parser.parse_args()
+
+    # Adjust console logging based on verbosity
+    root_logger = logging.getLogger()
+    if args.verbose:
+        root_logger.setLevel(logging.DEBUG)
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                handler.setLevel(logging.DEBUG)
+    else:
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                handler.setLevel(logging.ERROR)
 
     # ---- load optional settings from config file and environment ----
     cfg = load_config()
@@ -564,8 +596,13 @@ async def main():
         "hibp_api_key")
     logger.debug("Using crawl depth %d", depth)
 
-    results = await scan_domain(args.domain, depth, hibp_key,
-                                verbose=args.verbose)
+    results = await scan_domain(
+        args.domain,
+        depth,
+        hibp_key,
+        verbose=args.verbose,
+        save_json=args.json,
+    )
     subdomains = results["subdomains"]
     emails = results["emails"]
     phones = results["phones"]

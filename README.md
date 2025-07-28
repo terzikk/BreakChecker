@@ -33,10 +33,11 @@ environment variables. The file should contain:
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
 # optional: export CRAWL_DEPTH=2
-python break_checker.py example.com --depth 2
+python break_checker.py example.com --depth 2 --json
 ```
-Run the script with the target domain as an argument. Configuration can also be
-provided in `config.json` as shown above.
+Run the script with the target domain as an argument. Add `--json` to write a
+`results.json` file and `--verbose` to display detailed log output.
+Configuration can also be provided in `config.json` as shown above.
 
 ## Running the API server
 

@@ -1,10 +1,10 @@
 """Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 break_checker.py
+  python3 break_checker.py <domain> [--depth N] [--hibp-key KEY] [--verbose]
 
-The script prompts for the target domain. API credentials and crawl depth are
-loaded from ``config.json`` if present, falling back to environment variables:
+The script reads API credentials and crawl depth from ``config.json`` if
+present, falling back to environment variables:
 
   HIBP_API_KEY   - HaveIBeenPwned API key
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import json
+import argparse
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
@@ -546,19 +547,25 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
 
 async def main():
     """Entry point for command line execution."""
-    # ---- domain prompt ----
-    domain = input("Enter domain name (e.g., example.com): ").strip()
-    if not domain:
-        print("No domain provided. Exiting.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Domain crawler, subdomain enumerator and breach checker")
+    parser.add_argument("domain", help="Target domain to scan")
+    parser.add_argument("--depth", type=int, help="Maximum crawl depth")
+    parser.add_argument("--hibp-key", help="HIBP API key")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose output")
+    args = parser.parse_args()
 
     # ---- load optional settings from config file and environment ----
     cfg = load_config()
-    depth = int(os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
-    hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
+    depth = args.depth if args.depth is not None else int(
+        os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
+    hibp_key = args.hibp_key or os.environ.get("HIBP_API_KEY") or cfg.get(
+        "hibp_api_key")
     logger.debug("Using crawl depth %d", depth)
 
-    results = await scan_domain(domain, depth, hibp_key, verbose=True)
+    results = await scan_domain(args.domain, depth, hibp_key,
+                                verbose=args.verbose)
     subdomains = results["subdomains"]
     emails = results["emails"]
     phones = results["phones"]

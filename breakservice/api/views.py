@@ -3,19 +3,23 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 import os
-from break_checker import scan_domain, load_config
+from break_checker import scan_domain, load_config, validate_domain
 
 import logging
 
 
 class ScanView(APIView):
     def post(self, request):
-        domain = request.data.get("domain")
-        if not domain:
+        domain_raw = request.data.get("domain")
+        if not domain_raw:
             return Response(
                 {"error": "domain parameter required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        valid, domain, msg = validate_domain(domain_raw, check_dns=False)
+        if not valid:
+            return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
         try:
             cfg = load_config()
             depth = int(request.data.get(
@@ -23,10 +27,9 @@ class ScanView(APIView):
             hibp_key = os.environ.get(
                 "HIBP_API_KEY") or cfg.get("hibp_api_key")
             logging.info(
-                "SCAN: Starting scan for %s (depth=%s)", domain, depth)
+                "SCAN: Starting scan for %s ", domain)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-            logging.info("SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones", domain, len(
-                results["breached_emails"]), len(results["emails"]), len(results["phones"]))
+            logging.info("SCAN: Scan completed for %s", domain)
         except Exception as e:
             logging.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)

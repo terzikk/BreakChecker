@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
+import time
 from urllib.parse import urljoin, urlparse
 from collections import deque
 import datetime
@@ -44,10 +45,11 @@ import requests
 from bs4 import BeautifulSoup
 import shutil
 import subprocess
-from typing import Set, List, Optional, Dict
+from typing import Set, List, Optional, Dict, Tuple
 import aiohttp
 from playwright.async_api import async_playwright
 from email_validator import validate_email, EmailNotValidError
+import socket
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
@@ -99,6 +101,54 @@ def load_config() -> dict:
         # Missing or invalid config is silently ignored
         logger.debug("Could not load config.json: %s", exc)
     return config
+
+
+def validate_domain(user_input: str, *, check_dns: bool = True) -> Tuple[bool, str, str]:
+    """Validate and sanitize a domain provided by a user."""
+    if not user_input or not user_input.strip():
+        return False, "", "No domain provided"
+
+    raw = user_input.strip()
+    parsed = urlparse(raw if "//" in raw else f"//{raw}")
+    host = parsed.netloc or parsed.path
+
+    if host.lower().startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+
+    host = host.strip('.').lower()
+    if not host:
+        return False, "", "No domain provided"
+
+    try:
+        host_ascii = host.encode("idna").decode("ascii")
+    except Exception:
+        return False, "", "Invalid internationalized domain"
+
+    if len(host_ascii) > 253:
+        return False, "", "Domain exceeds maximum length"
+
+    labels = host_ascii.split('.')
+    if len(labels) < 2 or len(labels[-1]) < 2:
+        return False, "", "Domain must include a valid TLD"
+
+    label_re = re.compile(
+        r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)$")
+    for label in labels:
+        if len(label) == 0 or len(label) > 63:
+            return False, "", "Domain label length invalid"
+        if not label_re.fullmatch(label):
+            return False, "", "Invalid domain format"
+
+    if check_dns:
+        try:
+            socket.gethostbyname(host_ascii)
+            return True, host_ascii, "Valid and resolvable"
+        except Exception:
+            return False, "", "Domain is not resolvable"
+
+    return True, host_ascii, "Valid"
 
 
 def enumerate_subdomains(domain: str) -> Set[str]:
@@ -449,13 +499,18 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
         logger.debug("Checking HIBP proxy for %s", email)
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
-            # Assume the proxy returns a JSON list of breach objects
             breaches = [b.get("Name") for b in resp.json()]
             logger.info("%s found in %d breaches", email, len(breaches))
+            time.sleep(6)  # Try 2 seconds
             return breaches
         if resp.status_code == 404:
             logger.info("%s not found in HIBP (proxy)", email)
+            time.sleep(6)
             return []
+        if resp.status_code == 429:
+            logger.warning("Rate limit hit. Sleeping longer before next call.")
+            time.sleep(10)  # Back off more if rate limited
+            return None
         logger.warning("Unexpected HIBP proxy response: %s %s",
                        resp.status_code, resp.text)
     except Exception as exc:
@@ -577,13 +632,6 @@ async def scan_domain(
         if breaches:
             breached_emails[email] = breaches
 
-    # Expose the collected data directly for easier consumption by callers.
-    logger.info(
-        "Scan complete: %d emails, %d phones, %d breached emails",
-        len(crawler.emails),
-        len(crawler.phones),
-        len(breached_emails),
-    )
     results = {
         "crawler": crawler,
         "subdomains": set(subdomain_schemes.keys()),
@@ -644,10 +692,15 @@ async def main() -> dict:
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)
 
+    valid, domain_norm, msg = validate_domain(args.domain, check_dns=True)
+    if not valid:
+        logger.error(msg)
+        sys.exit(1)
+
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
 
     results = await scan_domain(
-        args.domain,
+        domain_norm,
         args.depth,
         hibp_key,
         verbose=args.verbose,
@@ -655,12 +708,12 @@ async def main() -> dict:
         json_output=args.json,
     )
 
-    logger.info(
-        "Summary for %s: %d emails, %d phones, %d breached",
-        args.domain,
+    logging.info(
+        "SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones",
+        domain_norm,
+        len(results["breached_emails"]),
         len(results["emails"]),
         len(results["phones"]),
-        len(results["breached_emails"]),
     )
 
     return results

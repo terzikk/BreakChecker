@@ -25,12 +25,8 @@ class ScanView(APIView):
             logging.info(
                 "SCAN: Starting scan for %s (depth=%s)", domain, depth)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-            logging.info("SCAN: Scan completed for %s", domain)
-            logging.info(
-                "SCAN: emails=%d phones=%d breached=%d",
-                len(results["emails"]),
-                len(results["phones"]),
-                len(results["breached_emails"]))
+            logging.info("SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones", domain, len(
+                results["breached_emails"]), len(results["emails"]), len(results["phones"]))
         except Exception as e:
             logging.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)

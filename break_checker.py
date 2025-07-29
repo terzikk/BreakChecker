@@ -1,10 +1,10 @@
 """Domain crawler, subdomain enumerator and breach checker.
 
 Usage:
-  python3 break_checker.py
+  python3 break_checker.py [options] domain
 
-The script prompts for the target domain. API credentials and crawl depth are
-loaded from ``config.json`` if present, falling back to environment variables:
+The script now accepts command line arguments. API credentials and crawl depth
+are loaded from ``config.json`` if present, falling back to environment variables:
 
   HIBP_API_KEY   - HaveIBeenPwned API key
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
@@ -13,6 +13,12 @@ Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
 ``crawl_depth`` to avoid setting environment variables each run. If the
 ``katana`` command is available it will be used for deeper and faster crawling. Katana
 collects additional URLs which are then processed by this script.
+
+Command line options:
+  -d, --depth        Maximum crawl depth
+  -v, --verbose      Enable debug logging
+  -j, --json         Save results to DOMAIN.json only
+  -c, --concurrency  Number of concurrent workers
 """
 
 # This script gathers subdomains for a target domain, crawls each host for
@@ -26,11 +32,13 @@ import os
 import re
 import sys
 import json
+import argparse
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urljoin, urlparse
 from collections import deque
+import datetime
 import phonenumbers
 import requests
 from bs4 import BeautifulSoup
@@ -42,21 +50,26 @@ from playwright.async_api import async_playwright
 from email_validator import validate_email, EmailNotValidError
 
 
-def configure_logging() -> logging.Logger:
+def configure_logging(level: int = logging.INFO) -> logging.Logger:
+    """Configure root logging and return module logger."""
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     root_logger = logging.getLogger()
     # Remove all handlers before adding new ones to avoid duplicates
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
+
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)s:%(name)s:%(message)s")
+
     file_handler = RotatingFileHandler(
         log_file, maxBytes=1_000_000, backupCount=3)
     stream_handler = logging.StreamHandler()
+
     for handler in (file_handler, stream_handler):
         handler.setFormatter(formatter)
         root_logger.addHandler(handler)
-    root_logger.setLevel(logging.INFO)
+
+    root_logger.setLevel(level)
     return logging.getLogger(__name__)
 
 
@@ -318,28 +331,38 @@ class Crawler:
         self.phone_sources: dict[str, str] = {}
 
     def add_email(self, email: str, source: str, snippet: str = "") -> None:
-        """Store email if not already seen (case-insensitive)."""
+        """Store email and log discovery once unless verbose."""
         canon = normalize_email(email)
         if not canon:
             return
+        trimmed_snippet = " ".join(snippet.strip().split())
         if canon not in self.emails:
             self.emails[canon] = canon
             self.email_sources[canon] = source
-        trimmed_snippet = " ".join(snippet.strip().split())
-        logger.info("Email %s found at %s | %s",
-                    canon, source, trimmed_snippet)
+            logger.info(
+                "Email %s found at %s | %s", canon, source, trimmed_snippet
+            )
+        else:
+            logger.debug(
+                "Email %s found at %s | %s", canon, source, trimmed_snippet
+            )
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
-        """Store phone in normalized form if valid and not already seen."""
+        """Store phone and log once unless verbose."""
         norm = normalize_phone(phone)
 
         if norm:
+            trimmed_snippet = " ".join(snippet.strip().split())
             if norm not in self.phones:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
-            trimmed_snippet = " ".join(snippet.strip().split())
-            logger.info("Phone %s found at %s | %s",
-                        norm, source, trimmed_snippet)
+                logger.info(
+                    "Phone %s found at %s | %s", norm, source, trimmed_snippet
+                )
+            else:
+                logger.debug(
+                    "Phone %s found at %s | %s", norm, source, trimmed_snippet
+                )
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -440,8 +463,8 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
-def save_results(results: dict) -> None:
-    """Write emails, phones and their sources to output files."""
+def save_results(results: dict, domain: str, json_output: bool = False) -> None:
+    """Persist scan results to disk."""
     crawler = results.get("crawler")
     emails = results.get("emails", set())
     phones = results.get("phones", set())
@@ -460,18 +483,47 @@ def save_results(results: dict) -> None:
                 src = sources.get(canon, "")
                 f.write(f"{value}\t{src}\n")
 
-    if crawler:
-        write_map("email_sources.txt", crawler.emails, email_sources)
-        write_map("phone_sources.txt", crawler.phones, phone_sources)
-    write_list("emails.txt", emails)
-    write_list("phones.txt", phones)
-    write_list("breached_emails.txt", breached_emails.keys())
-    logger.info("Results written to output files")
+    prefix = domain.replace('/', '_')
+    timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
+    if json_output:
+        output = {
+            "subdomains": sorted(results.get("subdomains", [])),
+            "emails": sorted(emails),
+            "phones": sorted(phones),
+            "breached_emails": breached_emails,
+            "email_sources": email_sources,
+            "phone_sources": phone_sources,
+        }
+        filename = f"{prefix}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2)
+        logger.info("Results written to %s", filename)
+    else:
+        output_dir = f"{prefix}_{timestamp}"
+        os.makedirs(output_dir, exist_ok=True)
+        if crawler:
+            write_map(os.path.join(output_dir, "email_sources.txt"),
+                      crawler.emails, email_sources)
+            write_map(os.path.join(output_dir, "phone_sources.txt"),
+                      crawler.phones, phone_sources)
+        write_list(os.path.join(output_dir, "emails.txt"), emails)
+        write_list(os.path.join(output_dir, "phones.txt"), phones)
+        write_list(os.path.join(output_dir, "breached_emails.txt"),
+                   breached_emails.keys())
+        logger.info("Results written to directory %s", output_dir)
 
 # ---------------------- High level scan function ----------------------
 
 
-async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = None, *, verbose: bool = False) -> dict:
+async def scan_domain(
+    domain: str,
+    depth: int = 3,
+    hibp_key: Optional[str] = None,
+    *,
+    verbose: bool = False,
+    concurrency: int = 5,
+    json_output: bool = False,
+) -> dict:
     """Crawl a domain and optionally check emails against HIBP.
 
     The returned dictionary now exposes the discovered subdomains, emails and
@@ -479,31 +531,35 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
     serialize the data as JSON.
     """
     if verbose:
-        print(f"Enumerating subdomains for {domain}...")
-    logger.info("Scanning domain %s at depth %d", domain, depth)
+        logger.debug("Enumerating subdomains for %s", domain)
+    logger.info("Scanning %s at depth %d", domain, depth)
     subs = enumerate_subdomains(domain)
     subdomain_schemes = filter_accessible_subdomains(subs)
     if verbose:
-        print(f"{len(subdomain_schemes)} out of {len(subs)} subdomains are accessible")
+        logger.debug(
+            "%d of %d subdomains are accessible", len(
+                subdomain_schemes), len(subs)
+        )
         for sub in sorted(subdomain_schemes):
-            print(f" [+] {sub}")
+            logger.debug(" [+] %s", sub)
 
     use_katana = shutil.which("katana") is not None
     if use_katana and verbose:
-        print("Using katana for deep enumeration")
+        logger.debug("Using katana for deep enumeration")
     if use_katana:
         logger.info("katana available; using for enumeration")
     else:
         logger.info("katana not available; using internal crawler only")
 
-    crawler = Crawler(domain, max_depth=0 if use_katana else depth)
+    crawler = Crawler(
+        domain, max_depth=0 if use_katana else depth, concurrency=concurrency)
 
     for sub, scheme in subdomain_schemes.items():
         scheme = choose_scheme(sub)
         start_url = f"{scheme}://{sub}"
         if verbose:
-            print(f"\nCrawling {start_url} ...")
-        logger.info("Starting to crawl %s", start_url)
+            logger.debug("Crawling %s", start_url)
+        logger.info("Starting crawl at %s", start_url)
         if use_katana:
             urls = gather_with_katana(start_url, depth)
             if not urls:
@@ -538,48 +594,75 @@ async def scan_domain(domain: str, depth: int = 3, hibp_key: Optional[str] = Non
         "phone_sources": crawler.phone_sources,
     }
 
-    save_results(results)
+    save_results(results, domain, json_output)
     return results
 
 
 # ---------------------- Main logic ----------------------
 
-async def main():
+def parse_args(default_depth: int) -> argparse.Namespace:
+    """Return parsed command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Crawl a domain and check emails against breach data",
+    )
+    parser.add_argument("domain", help="Target domain to scan")
+    parser.add_argument(
+        "-d",
+        "--depth",
+        type=int,
+        default=default_depth,
+        help="Maximum crawl depth (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    parser.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="Write results to DOMAIN.json only",
+    )
+    parser.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Number of concurrent workers",
+    )
+    return parser.parse_args()
+
+
+async def main() -> dict:
     """Entry point for command line execution."""
-    # ---- domain prompt ----
-    domain = input("Enter domain name (e.g., example.com): ").strip()
-    if not domain:
-        print("No domain provided. Exiting.")
-        sys.exit(1)
-
-    # ---- load optional settings from config file and environment ----
     cfg = load_config()
-    depth = int(os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
+    default_depth = int(os.environ.get(
+        "CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
+    args = parse_args(default_depth)
+
+    configure_logging(logging.DEBUG if args.verbose else logging.INFO)
+
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
-    logger.debug("Using crawl depth %d", depth)
 
-    results = await scan_domain(domain, depth, hibp_key, verbose=True)
-    subdomains = results["subdomains"]
-    emails = results["emails"]
-    phones = results["phones"]
-    breached_emails = results["breached_emails"]
+    results = await scan_domain(
+        args.domain,
+        args.depth,
+        hibp_key,
+        verbose=args.verbose,
+        concurrency=args.concurrency,
+        json_output=args.json,
+    )
 
-    # ---- print summary to console ----
-    print("\n--------- Summary ---------")
-    print(f"Emails found: {len(emails)}")
-    print(f"Breached emails: {len(breached_emails)}")
-    print(f"Phone numbers found: {len(phones)}")
+    logger.info(
+        "Summary for %s: %d emails, %d phones, %d breached",
+        args.domain,
+        len(results["emails"]),
+        len(results["phones"]),
+        len(results["breached_emails"]),
+    )
 
-    if breached_emails:
-        print("\nBreached Emails:")
-        for email, breaches in breached_emails.items():
-            print(f" - {email}: {', '.join(breaches)}")
-
-    print("\nResults saved to emails.txt, breached_emails.txt, phones.txt")
-    logger.info("Summary: %d emails, %d phones, %d breached",
-                len(emails), len(phones), len(breached_emails))
-
-    # ---- return results so callers can use them ----
     return results
 
 

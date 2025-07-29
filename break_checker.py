@@ -541,6 +541,8 @@ def save_results(results: dict, domain: str, json_output: bool = False) -> None:
     prefix = domain.replace('/', '_')
     timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     if json_output:
+        output_dir = f"{prefix}_{timestamp}"
+        os.makedirs(output_dir, exist_ok=True)
         output = {
             "subdomains": sorted(results.get("subdomains", [])),
             "emails": sorted(emails),
@@ -549,10 +551,10 @@ def save_results(results: dict, domain: str, json_output: bool = False) -> None:
             "email_sources": email_sources,
             "phone_sources": phone_sources,
         }
-        filename = f"{prefix}.json"
+        filename = os.path.join(output_dir, f"{prefix}.json")
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2)
-        logger.info("Results written to %s", filename)
+        logger.info("Results written to directory %s", output_dir)
     else:
         output_dir = f"{prefix}_{timestamp}"
         os.makedirs(output_dir, exist_ok=True)
@@ -671,7 +673,7 @@ def parse_args(default_depth: int) -> argparse.Namespace:
         "-j",
         "--json",
         action="store_true",
-        help="Write results to DOMAIN.json only",
+        help="Write results as DOMAIN.json in a timestamped directory",
     )
     parser.add_argument(
         "-c",

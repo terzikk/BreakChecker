@@ -3,7 +3,12 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 import os
-from break_checker import scan_domain, load_config
+from break_checker import (
+    scan_domain,
+    load_config,
+    sanitize_domain,
+    validate_domain,
+)
 
 import logging
 
@@ -16,6 +21,14 @@ class ScanView(APIView):
                 {"error": "domain parameter required"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        clean = sanitize_domain(domain)
+        if not clean:
+            valid, reason = validate_domain(domain)
+            return Response(
+                {"error": f"invalid domain: {reason}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        domain = clean
         try:
             cfg = load_config()
             depth = int(request.data.get(

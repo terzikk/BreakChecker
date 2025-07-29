@@ -37,6 +37,7 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urljoin, urlparse
+import socket
 from collections import deque
 import datetime
 import phonenumbers
@@ -281,6 +282,60 @@ EMAIL_RE = re.compile(
 )
 PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
 
+# Strict domain regex covering label structure and TLD requirements. IDNA
+# domains are handled by ``clean_domain`` which converts Unicode to Punycode.
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
+
+def clean_domain(domain: str) -> Optional[str]:
+    """Extract, normalize and clean a domain from a URL or raw input."""
+    if not domain:
+        return None
+    domain = domain.strip().lower()
+    if "://" in domain:
+        parsed = urlparse(domain)
+        domain = parsed.netloc or parsed.path
+    domain = domain.split("/")[0]
+    domain = domain.split(":")[0]
+    if domain.startswith("www."):
+        domain = domain[4:]
+    try:
+        domain = domain.encode("idna").decode("ascii")
+    except Exception:
+        return None
+    return domain
+
+
+def validate_domain(domain: str, check_dns: bool = False) -> tuple[bool, str]:
+    """Validate ``domain`` after cleaning. Optionally verify DNS resolution."""
+    domain = clean_domain(domain)
+    if not domain:
+        return False, "No domain provided or normalization failed"
+    if not DOMAIN_RE.match(domain):
+        return False, "Invalid domain format"
+    labels = domain.split(".")
+    if any(len(label) == 0 or len(label) > 63 for label in labels):
+        return False, "One or more labels have invalid length"
+    if check_dns:
+        try:
+            socket.gethostbyname(domain)
+            return True, "Valid and resolvable"
+        except socket.gaierror:
+            return True, "Valid format but not resolvable"
+    return True, "Valid format"
+
+
+def sanitize_domain(domain: str) -> Optional[str]:
+    """Return a cleaned domain if valid, otherwise ``None``."""
+    cleaned = clean_domain(domain)
+    if not cleaned:
+        return None
+    valid, _ = validate_domain(cleaned)
+    return cleaned if valid else None
+
 
 def normalize_email(email: str) -> Optional[str]:
     """Validate and normalize an email address after regex extraction.
@@ -517,6 +572,11 @@ async def scan_domain(
     phone numbers directly so callers like the microservice can easily
     serialize the data as JSON.
     """
+    domain_clean = sanitize_domain(domain)
+    if not domain_clean:
+        raise ValueError(f"Invalid domain: {domain}")
+    domain = domain_clean
+
     if verbose:
         logger.debug("Enumerating subdomains for %s", domain)
     logger.info("Scanning %s at depth %d", domain, depth)
@@ -630,8 +690,13 @@ async def main() -> dict:
 
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
 
+    clean_domain_arg = sanitize_domain(args.domain)
+    if not clean_domain_arg:
+        valid, reason = validate_domain(args.domain)
+        raise SystemExit(f"Invalid domain: {reason}")
+
     results = await scan_domain(
-        args.domain,
+        clean_domain_arg,
         args.depth,
         hibp_key,
         verbose=args.verbose,

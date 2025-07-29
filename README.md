@@ -36,7 +36,9 @@ export HIBP_API_KEY=YOUR_HIBP_KEY
 python breach_checker.py
 ```
 Follow the prompts to scan a domain and save results locally. The configuration
-can also be provided in `config.json` as shown above.
+can also be provided in `config.json` as shown above. The command expects a
+valid domain name. Input is cleaned and validated against a strict pattern so
+malformed or impossible domains are rejected.
 
 ## Running the API server
 
@@ -55,7 +57,9 @@ Then send a POST request to `/api/scan/` with JSON:
 { "domain": "example.com", "depth": 2 }
 ```
 
-The response includes discovered subdomains, emails, phones and breach info.
+The API cleans and validates the submitted domain in the same way and rejects
+malformed values. The response includes discovered subdomains, emails, phones
+and breach info.
 
 ## Deploying with Docker Compose
 

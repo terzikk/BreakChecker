@@ -17,7 +17,9 @@ collects additional URLs which are then processed by this script.
 Command line options:
   -d, --depth        Maximum crawl depth
   -v, --verbose      Enable debug logging
-  -j, --json         Save results to DOMAIN.json only
+  -j, --json         Save results as DOMAIN-TIMESTAMP.json
+  --csv             Save results as DOMAIN-TIMESTAMP.csv
+  --md, --report    Save results as DOMAIN-TIMESTAMP.md
   -c, --concurrency  Number of concurrent workers
 """
 
@@ -518,56 +520,97 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
-def save_results(results: dict, domain: str, json_output: bool = False) -> None:
-    """Persist scan results to disk."""
+def save_results(
+    results: dict,
+    domain: str,
+    *,
+    fmt: str = "json",
+    output_path: str | None = None,
+) -> str:
+    """Persist scan results to disk and return the file path."""
+
     crawler = results.get("crawler")
-    emails = results.get("emails", set())
-    phones = results.get("phones", set())
     email_sources = results.get("email_sources", {})
     phone_sources = results.get("phone_sources", {})
     breached_emails = results.get("breached_emails", {})
 
-    def write_list(filename: str, data):
-        with open(filename, "w", encoding="utf-8") as f:
-            for item in sorted(data):
-                f.write(str(item) + "\n")
+    emails = []
+    for email in sorted(results.get("emails", set())):
+        emails.append(
+            {
+                "email": email,
+                "source": email_sources.get(email, ""),
+                "breaches": breached_emails.get(email, []),
+            }
+        )
 
-    def write_map(filename: str, values: dict[str, str], sources: dict[str, str]):
-        with open(filename, "w", encoding="utf-8") as f:
-            for canon, value in sorted(values.items()):
-                src = sources.get(canon, "")
-                f.write(f"{value}\t{src}\n")
+    phones = []
+    for phone in sorted(results.get("phones", set())):
+        phones.append({"phone": phone, "source": phone_sources.get(phone, "")})
 
-    prefix = domain.replace('/', '_')
-    timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    if json_output:
-        output_dir = f"{prefix}_{timestamp}"
-        os.makedirs(output_dir, exist_ok=True)
-        output = {
-            "subdomains": sorted(results.get("subdomains", [])),
-            "emails": sorted(emails),
-            "phones": sorted(phones),
-            "breached_emails": breached_emails,
-            "email_sources": email_sources,
-            "phone_sources": phone_sources,
-        }
-        filename = os.path.join(output_dir, f"{prefix}.json")
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2)
-        logger.info("Results written to directory %s", output_dir)
+    report = {
+        "scan_domain": domain,
+        "scan_time": datetime.datetime.utcnow()
+        .replace(tzinfo=datetime.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        "subdomains": sorted(results.get("subdomains", [])),
+        "emails": emails,
+        "phones": phones,
+    }
+
+    base = domain.replace("/", "_")
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    if not output_path:
+        output_path = f"{base}-{timestamp}.{fmt}"
+
+    if fmt == "json":
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+    elif fmt == "csv":
+        import csv
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["type", "value", "source", "breaches"])
+            for sub in report["subdomains"]:
+                writer.writerow(["subdomain", sub, "", ""])
+            for item in emails:
+                writer.writerow(
+                    [
+                        "email",
+                        item["email"],
+                        item["source"],
+                        ", ".join(item["breaches"]),
+                    ]
+                )
+            for item in phones:
+                writer.writerow(["phone", item["phone"], item["source"], ""])
+    elif fmt == "md":
+        lines = [f"# Scan Report for {domain}", ""]
+        lines.append("## Subdomains")
+        for sub in report["subdomains"]:
+            lines.append(f"- {sub}")
+        lines.append("")
+        lines.append("## Emails")
+        lines.append("| Email | Source | Breaches |")
+        lines.append("| --- | --- | --- |")
+        for item in emails:
+            breaches = ", ".join(item["breaches"])
+            lines.append(f"| {item['email']} | {item['source']} | {breaches} |")
+        lines.append("")
+        lines.append("## Phones")
+        lines.append("| Phone | Source |")
+        lines.append("| --- | --- |")
+        for item in phones:
+            lines.append(f"| {item['phone']} | {item['source']} |")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
     else:
-        output_dir = f"{prefix}_{timestamp}"
-        os.makedirs(output_dir, exist_ok=True)
-        if crawler:
-            write_map(os.path.join(output_dir, "email_sources.txt"),
-                      crawler.emails, email_sources)
-            write_map(os.path.join(output_dir, "phone_sources.txt"),
-                      crawler.phones, phone_sources)
-        write_list(os.path.join(output_dir, "emails.txt"), emails)
-        write_list(os.path.join(output_dir, "phones.txt"), phones)
-        write_list(os.path.join(output_dir, "breached_emails.txt"),
-                   breached_emails.keys())
-        logger.info("Results written to directory %s", output_dir)
+        raise ValueError(f"Unknown format: {fmt}")
+
+    logger.info("Results written to %s", output_path)
+    return output_path
 
 # ---------------------- High level scan function ----------------------
 
@@ -579,7 +622,6 @@ async def scan_domain(
     *,
     verbose: bool = False,
     concurrency: int = 5,
-    json_output: bool = False,
 ) -> dict:
     """Crawl a domain and optionally check emails against HIBP.
 
@@ -644,7 +686,6 @@ async def scan_domain(
         "phone_sources": crawler.phone_sources,
     }
 
-    save_results(results, domain, json_output)
     return results
 
 
@@ -669,11 +710,30 @@ def parse_args(default_depth: int) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging",
     )
-    parser.add_argument(
+    fmt_group = parser.add_mutually_exclusive_group()
+    fmt_group.add_argument(
         "-j",
         "--json",
         action="store_true",
-        help="Write results as DOMAIN.json in a timestamped directory",
+        help="Save results as DOMAIN-TIMESTAMP.json (default)",
+    )
+    fmt_group.add_argument(
+        "--csv",
+        action="store_true",
+        help="Save results as DOMAIN-TIMESTAMP.csv",
+    )
+    fmt_group.add_argument(
+        "--md",
+        "--report",
+        dest="md",
+        action="store_true",
+        help="Save results as DOMAIN-TIMESTAMP.md markdown report",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Optional output file path",
+        default=None,
     )
     parser.add_argument(
         "-c",
@@ -707,8 +767,16 @@ async def main() -> dict:
         hibp_key,
         verbose=args.verbose,
         concurrency=args.concurrency,
-        json_output=args.json,
     )
+
+    if args.csv:
+        fmt = "csv"
+    elif args.md:
+        fmt = "md"
+    else:
+        fmt = "json"
+
+    save_results(results, domain_norm, fmt=fmt, output_path=args.output)
 
     logging.info(
         "SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones",

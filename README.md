@@ -12,9 +12,10 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Two environment variables configure the crawler:
+Three environment variables configure the crawler:
 
 - `HIBP_API_KEY` – HaveIBeenPwned API key.
+- `LEAKCHECK_API_KEY` – LeakCheck API key for phone breach lookup.
 - `CRAWL_DEPTH` – maximum crawl depth (defaults to `3`).
 
 When a `config.json` file exists in the repository root it overrides the
@@ -23,6 +24,7 @@ environment variables. The file should contain:
 ```json
 {
   "hibp_api_key": "YOUR_HIBP_KEY",
+  "leakcheck_api_key": "YOUR_LEAKCHECK_KEY",
   "crawl_depth": 3
 }
 ```
@@ -32,6 +34,7 @@ environment variables. The file should contain:
 
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
+# optional: export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
 # optional: export CRAWL_DEPTH=2
 python breach_checker.py
 ```
@@ -45,6 +48,7 @@ Use Django's built-in server for testing. The server reads `HIBP_API_KEY` and
 
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
+# optional: export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
 # optional: export CRAWL_DEPTH=2
 python manage.py runserver
 ```
@@ -65,6 +69,7 @@ stack:
 
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
+# optional: export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
 # optional: export CRAWL_DEPTH=2
 docker-compose up --build
 ```

@@ -26,16 +26,17 @@ class ScanView(APIView):
                 "depth", os.environ.get("CRAWL_DEPTH", cfg.get("crawl_depth", 3))))
             hibp_key = os.environ.get(
                 "HIBP_API_KEY") or cfg.get("hibp_api_key")
+            leak_key = os.environ.get(
+                "LEAKCHECK_API_KEY") or cfg.get("leakcheck_api_key")
             logging.info(
                 "SCAN: Starting scan for %s ", domain)
-            results = async_to_sync(scan_domain)(domain, depth, hibp_key)
+            results = async_to_sync(scan_domain)(domain, depth, hibp_key, leak_key)
 
             logging.info(
-                "SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones",
+                "SCAN: Scan completed for %s with %d breached emails and %d breached phones",
                 domain,
                 len(results["breached_emails"]),
-                len(results["emails"]),
-                len(results["phones"]),
+                len(results.get("breached_phones", {})),
             )
         except Exception as e:
             logging.exception("SCAN: Exception in scan_domain")
@@ -48,6 +49,7 @@ class ScanView(APIView):
                 "num_emails": len(results["emails"]),
                 "num_phones": len(results["phones"]),
                 "num_breached_emails": len(results["breached_emails"]),
+                "num_breached_phones": len(results.get("breached_phones", {})),
             },
             "subdomains": sorted(results["subdomains"]),
             "emails": [
@@ -61,7 +63,8 @@ class ScanView(APIView):
             "phones": [
                 {
                     "number": phone,
-                    "source": results["phone_sources"].get(phone, "")
+                    "source": results["phone_sources"].get(phone, ""),
+                    "breaches": results.get("breached_phones", {}).get(phone, [])
                 }
                 for phone in sorted(results["phones"])
             ]

@@ -29,23 +29,42 @@ class ScanView(APIView):
             logging.info(
                 "SCAN: Starting scan for %s ", domain)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key)
-            logging.info("SCAN: Scan completed for %s", domain)
+
+            logging.info(
+                "SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones",
+                domain,
+                len(results["breached_emails"]),
+                len(results["emails"]),
+                len(results["phones"]),
+            )
         except Exception as e:
             logging.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)
 
         payload = {
+            "domain": domain,
             "summary": {
-                "num_subdomains":     len(results["subdomains"]),
-                "num_emails":         len(results["emails"]),
-                "num_phones":         len(results["phones"]),
+                "num_subdomains": len(results["subdomains"]),
+                "num_emails": len(results["emails"]),
+                "num_phones": len(results["phones"]),
                 "num_breached_emails": len(results["breached_emails"]),
             },
-            "subdomains":      sorted(results["subdomains"]),
-            "emails":          sorted(results["emails"]),
-            "phones":          sorted(results["phones"]),
-            "breached_emails": results["breached_emails"],
-            "email_sources":   results["email_sources"],
-            "phone_sources":   results["phone_sources"],
+            "subdomains": sorted(results["subdomains"]),
+            "emails": [
+                {
+                    "address": email,
+                    "source": results["email_sources"].get(email, ""),
+                    "breaches": results["breached_emails"].get(email, [])
+                }
+                for email in sorted(results["emails"])
+            ],
+            "phones": [
+                {
+                    "number": phone,
+                    "source": results["phone_sources"].get(phone, "")
+                }
+                for phone in sorted(results["phones"])
+            ]
         }
+
         return Response(payload)

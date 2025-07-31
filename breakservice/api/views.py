@@ -20,6 +20,7 @@ class ScanView(APIView):
         valid, domain, msg = validate_domain(domain_raw, check_dns=False)
         if not valid:
             return Response({"error": msg}, status=status.HTTP_400_BAD_REQUEST)
+        logging.debug("Domain %s is valid and resolvable.", domain)
         try:
             cfg = load_config()
             depth = int(request.data.get(
@@ -28,12 +29,11 @@ class ScanView(APIView):
                 "HIBP_API_KEY") or cfg.get("hibp_api_key")
             leak_key = os.environ.get(
                 "LEAKCHECK_API_KEY") or cfg.get("leakcheck_api_key")
-            logging.info(
-                "SCAN: Starting scan for %s ", domain)
+            logging.info("Starting scan for %s via API", domain)
             results = async_to_sync(scan_domain)(domain, depth, hibp_key, leak_key)
 
             logging.info(
-                "SCAN: Scan completed for %s with %d breached emails and %d breached phones",
+                "Scan completed for %s with %d breached emails and %d breached phones",
                 domain,
                 len(results["breached_emails"]),
                 len(results.get("breached_phones", {})),

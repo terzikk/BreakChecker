@@ -341,7 +341,7 @@ def gather_with_katana(start_url: str, depth: int) -> Set[str]:
 async def fetch_url(session, url: str) -> Optional[str]:
     """Fetch a URL using Playwright (for JavaScript-rendered content)."""
     try:
-        logger.debug("Fetching %s", url)
+        logger.debug("Launching browser to fetch %s...", url)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -445,16 +445,19 @@ class Crawler:
         if not canon:
             return
         trimmed_snippet = " ".join(snippet.strip().split())
-        if canon not in self.emails:
+        is_new = canon not in self.emails
+        if is_new:
             self.emails[canon] = canon
             self.email_sources[canon] = source
             logger.info(
-                "Email %s found at %s | %s", canon, source, trimmed_snippet
+                "Found email: %s (source: %s)", canon, source
             )
         else:
             logger.debug(
-                "Email %s found at %s | %s", canon, source, trimmed_snippet
+                "Duplicate email found: %s (new source: %s)", canon, source
             )
+        if logger.isEnabledFor(logging.DEBUG) and trimmed_snippet:
+            logger.debug("Email snippet: %s", trimmed_snippet)
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
         """Store phone and log once unless verbose."""
@@ -462,16 +465,19 @@ class Crawler:
 
         if norm:
             trimmed_snippet = " ".join(snippet.strip().split())
-            if norm not in self.phones:
+            is_new = norm not in self.phones
+            if is_new:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
                 logger.info(
-                    "Phone %s found at %s | %s", norm, source, trimmed_snippet
+                    "Found phone: %s (source: %s)", norm, source
                 )
             else:
                 logger.debug(
-                    "Phone %s found at %s | %s", norm, source, trimmed_snippet
+                    "Duplicate phone found: %s (new source: %s)", norm, source
                 )
+            if logger.isEnabledFor(logging.DEBUG) and trimmed_snippet:
+                logger.debug("Phone snippet: %s", trimmed_snippet)
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -491,10 +497,11 @@ class Crawler:
                     await asyncio.gather(*tasks)
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
-        logger.info("Crawling %s", url)
+        logger.debug("Crawling %s (depth: %d)", url, depth)
         content = await fetch_url(session, url)
         if not content:
             return
+        logger.debug("Extracting contact data from %s", url)
         self.extract_data(content, url)
         soup = BeautifulSoup(content, "html.parser")
         # also search the rendered text for emails split by HTML tags
@@ -759,6 +766,7 @@ async def scan_domain(
     phone numbers directly so callers like the microservice can easily
     serialize the data as JSON.
     """
+    start_time = time.time()
     logger.info(
         "Starting scan for %s (depth: %d, concurrency: %d)",
         domain,
@@ -853,9 +861,14 @@ async def scan_domain(
         "phone_sources": crawler.phone_sources,
     }
 
+    duration = time.time() - start_time
     logger.info(
-        "Scan Complete for %s. Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
+        "Scan Complete for %s in %.2f seconds.",
         domain,
+        duration,
+    )
+    logger.info(
+        "Summary: Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
         len(results["subdomains"]),
         len(results["emails"]),
         len(breached_emails),

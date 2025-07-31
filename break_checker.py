@@ -745,7 +745,7 @@ def save_results(
         raise ValueError(f"Unknown format: {fmt}")
 
     logger.debug("Results successfully saved to %s", output_path)
-    logger.info("Results written to %s", output_path)
+
     return output_path
 
 # ---------------------- High level scan function ----------------------
@@ -862,19 +862,7 @@ async def scan_domain(
     }
 
     duration = time.time() - start_time
-    logger.info(
-        "Scan Complete for %s in %.2f seconds.",
-        domain,
-        duration,
-    )
-    logger.info(
-        "Summary: Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
-        len(results["subdomains"]),
-        len(results["emails"]),
-        len(breached_emails),
-        len(results["phones"]),
-        len(breached_phones),
-    )
+    results["scan_duration"] = duration
 
     return results
 
@@ -974,7 +962,23 @@ async def main() -> dict:
 
     save_results(results, domain_norm, fmt=fmt, output_path=args.output)
 
+    logging.info("%s", "=" * 60)
     logging.info(
+        "Scan Complete for %s in %.2f seconds.",
+        domain_norm,
+        results.get("scan_duration", 0.0),
+    )
+    logging.info(
+        "Summary: Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
+        len(results["subdomains"]),
+        len(results["emails"]),
+        len(results["breached_emails"]),
+        len(results["phones"]),
+        len(results.get("breached_phones", {})),
+    )
+    logging.info("%s", "=" * 60)
+
+    logging.debug(
         "SCAN: Scan completed for %s with %d breached emails and %d breached phones",
         domain_norm,
         len(results["breached_emails"]),

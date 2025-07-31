@@ -1,4 +1,5 @@
 {
   "hibp_api_key": "YOUR_HIBP_KEY",
+  "leakcheck_api_key": "YOUR_LEAKCHECK_KEY",
   "crawl_depth": 3
 }

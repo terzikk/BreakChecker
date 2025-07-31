@@ -91,6 +91,7 @@ def load_config() -> dict:
     """Load optional API keys and settings from config.json."""
     config = {
         "hibp_api_key": None,
+        "leakcheck_api_key": None,
         "crawl_depth": 3,
     }
     try:
@@ -556,6 +557,43 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
+def check_leakcheck_phone(phone: str, api_key: Optional[str]) -> Optional[List[str]]:
+    """Return breach sources for a phone number using the LeakCheck v2 API."""
+    if not api_key:
+        return None
+
+    url = f"https://leakcheck.io/api/v2/query/{phone}"
+    headers = {"Accept": "application/json", "X-API-Key": api_key}
+    params = {"type": "phone"}
+    try:
+        logger.debug("Checking LeakCheck for %s", phone)
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("success") is True:
+                if data.get("found"):
+                    sources = []
+                    for item in data.get("result", []):
+                        src = item.get("source")
+                        if isinstance(src, dict):
+                            name = src.get("name")
+                            if name:
+                                sources.append(name)
+                        elif src:
+                            sources.append(str(src))
+                    return sources
+                return []
+        if resp.status_code == 429:
+            logger.warning("LeakCheck rate limit hit for %s", phone)
+            time.sleep(10)
+            return None
+        logger.warning("Unexpected LeakCheck response: %s %s", resp.status_code, resp.text)
+    except Exception as exc:
+        logger.warning("LeakCheck lookup failed for %s: %s", phone, exc)
+    return None
+
+
+
 def save_results(
     results: dict,
     domain: str,
@@ -569,6 +607,7 @@ def save_results(
     email_sources = results.get("email_sources", {})
     phone_sources = results.get("phone_sources", {})
     breached_emails = results.get("breached_emails", {})
+    breached_phones = results.get("breached_phones", {})
 
     emails = []
     for email in sorted(results.get("emails", set())):
@@ -582,7 +621,13 @@ def save_results(
 
     phones = []
     for phone in sorted(results.get("phones", set())):
-        phones.append({"phone": phone, "source": phone_sources.get(phone, "")})
+        phones.append(
+            {
+                "phone": phone,
+                "source": phone_sources.get(phone, ""),
+                "breaches": breached_phones.get(phone, []),
+            }
+        )
 
     report = {
         "scan_domain": domain,
@@ -621,7 +666,14 @@ def save_results(
                     ]
                 )
             for item in phones:
-                writer.writerow(["phone", item["phone"], item["source"], ""])
+                writer.writerow(
+                    [
+                        "phone",
+                        item["phone"],
+                        item["source"],
+                        ", ".join(item["breaches"]),
+                    ]
+                )
     elif fmt == "md":
         lines = [f"# Scan Report for {domain}", ""]
         lines.append("## Subdomains")
@@ -637,10 +689,11 @@ def save_results(
                 f"| {item['email']} | {item['source']} | {breaches} |")
         lines.append("")
         lines.append("## Phones")
-        lines.append("| Phone | Source |")
-        lines.append("| --- | --- |")
+        lines.append("| Phone | Source | Breaches |")
+        lines.append("| --- | --- | --- |")
         for item in phones:
-            lines.append(f"| {item['phone']} | {item['source']} |")
+            breaches = ", ".join(item["breaches"])
+            lines.append(f"| {item['phone']} | {item['source']} | {breaches} |")
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
     else:
@@ -656,6 +709,7 @@ async def scan_domain(
     domain: str,
     depth: int = 3,
     hibp_key: Optional[str] = None,
+    leakcheck_key: Optional[str] = None,
     *,
     verbose: bool = False,
     concurrency: int = 5,
@@ -713,12 +767,21 @@ async def scan_domain(
         if breaches:
             breached_emails[email] = breaches
 
+    breached_phones = {}
+    logger.info("Preparing to check %d phones with LeakCheck", len(crawler.phones))
+    for phone in crawler.phones.values():
+        logger.info("Calling check_leakcheck_phone for: %s", phone)
+        breaches = check_leakcheck_phone(phone, leakcheck_key)
+        if breaches:
+            breached_phones[phone] = breaches
+
     results = {
         "crawler": crawler,
         "subdomains": set(subdomain_schemes.keys()),
         "emails": set(crawler.emails.values()),
         "phones": set(crawler.phones.values()),
         "breached_emails": breached_emails,
+        "breached_phones": breached_phones,
         "email_sources": crawler.email_sources,
         "phone_sources": crawler.phone_sources,
     }
@@ -799,11 +862,13 @@ async def main() -> dict:
         sys.exit(1)
 
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
+    leak_key = os.environ.get("LEAKCHECK_API_KEY") or cfg.get("leakcheck_api_key")
 
     results = await scan_domain(
         domain_norm,
         args.depth,
         hibp_key,
+        leak_key,
         verbose=args.verbose,
         concurrency=args.concurrency,
     )
@@ -818,11 +883,10 @@ async def main() -> dict:
     save_results(results, domain_norm, fmt=fmt, output_path=args.output)
 
     logging.info(
-        "SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones",
+        "SCAN: Scan completed for %s with %d breached emails and %d breached phones",
         domain_norm,
         len(results["breached_emails"]),
-        len(results["emails"]),
-        len(results["phones"]),
+        len(results.get("breached_phones", {})),
     )
 
     return results

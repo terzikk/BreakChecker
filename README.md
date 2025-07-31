@@ -76,3 +76,10 @@ docker-compose up --build
 
 The API will be available on `http://localhost:8000/`.
 
+## Logging
+
+Run the CLI with `-v` or `--verbose` to enable debug logging. In verbose mode
+the crawler prints the depth of each URL as it is processed and shows a snippet
+around any discovered email or phone number. Without `-v` these snippets are
+omitted for cleaner output.
+

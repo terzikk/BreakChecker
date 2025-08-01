@@ -85,7 +85,7 @@ server with:
 
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
-export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY  # optional
+export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
 python manage.py runserver
 ```
 

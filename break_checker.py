@@ -63,7 +63,9 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
         root_logger.handlers.clear()
 
     formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s:%(name)s:%(message)s")
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     file_handler = RotatingFileHandler(
         log_file, maxBytes=1_000_000, backupCount=3)
@@ -74,6 +76,8 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
         root_logger.addHandler(handler)
 
     root_logger.setLevel(level)
+    # Verbose HTTP connection logs when debugging
+    logging.getLogger("urllib3").setLevel(level)
     return logging.getLogger(__name__)
 
 
@@ -91,6 +95,7 @@ def load_config() -> dict:
     """Load optional API keys and settings from config.json."""
     config = {
         "hibp_api_key": None,
+        "leakcheck_api_key": None,
         "crawl_depth": 3,
     }
     try:
@@ -165,14 +170,16 @@ def enumerate_subdomains(domain: str) -> Set[str]:
     # Try the "subfinder" tool first as it is fast and comprehensive
     if shutil.which("subfinder"):
         try:
+            logger.debug("Running subfinder for %s", domain)
             result = subprocess.run([
                 "subfinder",
                 "-silent",
                 "-d",
                 domain,
             ], capture_output=True, text=True, check=False, timeout=60)
-            subs.update(line.strip()
-                        for line in result.stdout.splitlines() if line.strip())
+            subs.update(
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            )
             logger.debug("subfinder returned %d subdomains", len(subs))
         except Exception as exc:
             # Ignore failures and fall back to web-based enumeration
@@ -180,8 +187,11 @@ def enumerate_subdomains(domain: str) -> Set[str]:
 
     # Use multiple free sources as fallback or supplement
     if not subs:
+        logger.debug(
+            "Subfinder wasn't found, querying API sources...")
         # Primary: crt.sh
         try:
+            logger.debug("Querying crt.sh for subdomains.")
             url = f"https://crt.sh/json?q={domain}"
             resp = requests.get(url, timeout=15)
             if resp.status_code == 200:
@@ -195,11 +205,14 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                         if sub and sub.endswith(domain):
                             subs.add(sub)
                 logger.debug("crt.sh returned %d subdomains", len(subs))
+            else:
+                logger.debug("crt.sh returned status %d.", resp.status_code)
         except Exception as exc:
             logger.debug("crt.sh lookup failed: %s", exc)
 
         # Supplement 1: HackerTarget
         try:
+            logger.debug("Querying HackerTarget for subdomains.")
             url = f"https://api.hackertarget.com/hostsearch/?q={domain}"
             resp = requests.get(url, timeout=15)
             if resp.status_code == 200:
@@ -212,11 +225,15 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                             hackertarget_count += 1
                 logger.debug("HackerTarget added %d new subdomains",
                              hackertarget_count)
+            else:
+                logger.debug("HackerTarget returned status %d.",
+                             resp.status_code)
         except Exception as exc:
             logger.debug("HackerTarget lookup failed: %s", exc)
 
         # Supplement 2: Anubis-DB
         try:
+            logger.debug("Querying Anubis-DB for subdomains.")
             url = f"https://anubisdb.com/anubis/subdomains/{domain}"
             resp = requests.get(url, timeout=15)
             if resp.status_code == 200:
@@ -228,6 +245,8 @@ def enumerate_subdomains(domain: str) -> Set[str]:
                         subs.add(subdomain)
                         anubis_count += 1
                 logger.debug("Anubis added %d new subdomains", anubis_count)
+            else:
+                logger.debug("Anubis-DB returned status %d.", resp.status_code)
         except Exception as exc:
             logger.debug("Anubis lookup failed: %s", exc)
 
@@ -237,16 +256,15 @@ def enumerate_subdomains(domain: str) -> Set[str]:
     return subs
 
 
-def choose_scheme(host: str) -> Optional[str]:
-    """Return the reachable scheme for *host* or ``None`` if unreachable."""
+async def choose_scheme(session: aiohttp.ClientSession, host: str) -> Optional[str]:
+    """Asynchronously return the reachable scheme for *host* or ``None`` if unreachable."""
     for scheme in ("https", "http"):
+        url = f"{scheme}://{host}"
         try:
-            resp = requests.head(
-                f"{scheme}://{host}", timeout=5, allow_redirects=True
-            )
-            if resp.status_code < 400:
-                logger.debug("%s is reachable via %s", host, scheme)
-                return scheme
+            async with session.head(url, allow_redirects=True) as resp:
+                if resp.status < 400:
+                    logger.debug("%s is reachable via %s", host, scheme)
+                    return scheme
         except Exception as exc:
             logger.debug("Error checking %s via %s: %s", host, scheme, exc)
             continue
@@ -254,18 +272,24 @@ def choose_scheme(host: str) -> Optional[str]:
     return None
 
 
-def filter_accessible_subdomains(subdomains: Set[str]) -> Dict[str, str]:
-    """Return mapping of reachable subdomains to their scheme."""
+async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int = 20) -> Dict[str, str]:
+    """Return mapping of reachable subdomains to their scheme using asynchronous probes."""
     live: Dict[str, str] = {}
-    for host in subdomains:
-        scheme = choose_scheme(host)
+    timeout = aiohttp.ClientTimeout(total=5)
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    hosts = list(subdomains)
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks = [choose_scheme(session, host) for host in hosts]
+        results = await asyncio.gather(*tasks)
+
+    for host, scheme in zip(hosts, results):
         if scheme:
             live[host] = scheme
         else:
             logger.debug("Removing unreachable subdomain: %s", host)
 
-    logger.info("Accessible subdomains: %d of %d",
-                len(live), len(subdomains))
+    logger.info("Accessible subdomains: %d of %d", len(live), len(subdomains))
     return live
 
 
@@ -311,7 +335,7 @@ def gather_with_katana(start_url: str, depth: int) -> Set[str]:
             )
             if endpoint not in urls:
                 urls.add(endpoint)
-                logger.info("katana scanned %s", endpoint)
+                logger.debug("katana scanned %s", endpoint)
 
         proc.wait(timeout=60 * depth)
         logger.debug("katana found %d urls", len(urls))
@@ -324,7 +348,7 @@ def gather_with_katana(start_url: str, depth: int) -> Set[str]:
 async def fetch_url(session, url: str) -> Optional[str]:
     """Fetch a URL using Playwright (for JavaScript-rendered content)."""
     try:
-        logger.debug("Fetching %s", url)
+        logger.debug("Launching browser to fetch %s...", url)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
@@ -418,22 +442,29 @@ class Crawler:
         self.email_sources: dict[str, str] = {}
         self.phone_sources: dict[str, str] = {}
 
+        logger.debug(
+            "Initializing internal crawler for https://%s", domain
+        )
+
     def add_email(self, email: str, source: str, snippet: str = "") -> None:
         """Store email and log discovery once unless verbose."""
         canon = normalize_email(email)
         if not canon:
             return
         trimmed_snippet = " ".join(snippet.strip().split())
-        if canon not in self.emails:
+        is_new = canon not in self.emails
+        if is_new:
             self.emails[canon] = canon
             self.email_sources[canon] = source
             logger.info(
-                "Email %s found at %s | %s", canon, source, trimmed_snippet
+                "Found email: %s (source: %s)", canon, source
             )
         else:
             logger.debug(
-                "Email %s found at %s | %s", canon, source, trimmed_snippet
+                "Duplicate email found: %s (new source: %s)", canon, source
             )
+        if logger.isEnabledFor(logging.DEBUG) and trimmed_snippet:
+            logger.debug("Email snippet: %s", trimmed_snippet)
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
         """Store phone and log once unless verbose."""
@@ -441,16 +472,19 @@ class Crawler:
 
         if norm:
             trimmed_snippet = " ".join(snippet.strip().split())
-            if norm not in self.phones:
+            is_new = norm not in self.phones
+            if is_new:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
                 logger.info(
-                    "Phone %s found at %s | %s", norm, source, trimmed_snippet
+                    "Found phone: %s (source: %s)", norm, source
                 )
             else:
                 logger.debug(
-                    "Phone %s found at %s | %s", norm, source, trimmed_snippet
+                    "Duplicate phone found: %s (new source: %s)", norm, source
                 )
+            if logger.isEnabledFor(logging.DEBUG) and trimmed_snippet:
+                logger.debug("Phone snippet: %s", trimmed_snippet)
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -470,10 +504,11 @@ class Crawler:
                     await asyncio.gather(*tasks)
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
-        logger.info("Crawling %s", url)
+        logger.debug("Crawling %s (depth: %d)", url, depth)
         content = await fetch_url(session, url)
         if not content:
             return
+        logger.debug("Extracting contact data from %s", url)
         self.extract_data(content, url)
         soup = BeautifulSoup(content, "html.parser")
         # also search the rendered text for emails split by HTML tags
@@ -538,21 +573,92 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
             breaches = [b.get("Name") for b in resp.json()]
-            logger.info("%s found in %d breaches", email, len(breaches))
-            time.sleep(6)  # Try 2 seconds
+            if breaches:
+                logger.warning(
+                    "BREACH (HIBP): %s is in %d breach(es).",
+                    email,
+                    len(breaches),
+                )
+            else:
+                logger.info(
+                    "OK (HIBP): %s was not found in any breaches.", email)
+            time.sleep(6)
             return breaches
         if resp.status_code == 404:
-            logger.info("%s not found in HIBP (proxy)", email)
+            logger.info("OK (HIBP): %s was not found in any breaches.", email)
             time.sleep(6)
             return []
         if resp.status_code == 429:
-            logger.warning("Rate limit hit. Sleeping longer before next call.")
-            time.sleep(10)  # Back off more if rate limited
+            logger.warning("HIBP rate limit hit. Sleeping for 10s.")
+            time.sleep(10)
             return None
         logger.warning("Unexpected HIBP proxy response: %s %s",
                        resp.status_code, resp.text)
     except Exception as exc:
         logger.warning("HIBP proxy lookup failed for %s: %s", email, exc)
+    return None
+
+
+# Track timestamps of recent LeakCheck requests to enforce local rate limits
+_leakcheck_recent = deque()
+
+
+def check_leakcheck_phone(phone: str, api_key: Optional[str]) -> Optional[List[str]]:
+    """Return breach sources for a phone number using the LeakCheck v2 API."""
+    if not api_key:
+        return None
+
+    # Enforce a local rate limit of 3 queries per second
+    now = time.time()
+    while _leakcheck_recent and now - _leakcheck_recent[0] >= 1.2:
+        _leakcheck_recent.popleft()
+    if len(_leakcheck_recent) >= 3:
+        sleep_for = 1.2 - (now - _leakcheck_recent[0])
+        logger.debug(
+            "LeakCheck local rate limit reached, sleeping %.2fs", sleep_for
+        )
+        time.sleep(max(0, sleep_for))
+    _leakcheck_recent.append(time.time())
+
+    url = f"https://leakcheck.io/api/v2/query/{phone}"
+    headers = {"Accept": "application/json", "X-API-Key": api_key}
+    params = {"type": "phone"}
+    try:
+        logger.debug("Checking LeakCheck for %s", phone)
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("success") is True:
+                if data.get("found"):
+                    sources = []
+                    for item in data.get("result", []):
+                        src = item.get("source")
+                        if isinstance(src, dict):
+                            name = src.get("name")
+                            if name:
+                                sources.append(name)
+                        elif src:
+                            sources.append(str(src))
+                    sources = list(dict.fromkeys(sources))
+                    logger.warning(
+                        "BREACH (LeakCheck): %s is in %d breach(es).",
+                        phone,
+                        len(sources),
+                    )
+                    return sources
+                logger.info(
+                    "OK (LeakCheck): %s was not found in any breaches.", phone
+                )
+                return []
+        if resp.status_code == 429:
+            logger.warning("LeakCheck rate limit hit. Sleeping for 10s.")
+            time.sleep(10)
+            return None
+        logger.warning(
+            "Unexpected LeakCheck response: %s %s", resp.status_code, resp.text
+        )
+    except Exception as exc:
+        logger.warning("LeakCheck lookup failed for %s: %s", phone, exc)
     return None
 
 
@@ -569,6 +675,7 @@ def save_results(
     email_sources = results.get("email_sources", {})
     phone_sources = results.get("phone_sources", {})
     breached_emails = results.get("breached_emails", {})
+    breached_phones = results.get("breached_phones", {})
 
     emails = []
     for email in sorted(results.get("emails", set())):
@@ -582,7 +689,13 @@ def save_results(
 
     phones = []
     for phone in sorted(results.get("phones", set())):
-        phones.append({"phone": phone, "source": phone_sources.get(phone, "")})
+        phones.append(
+            {
+                "phone": phone,
+                "source": phone_sources.get(phone, ""),
+                "breaches": breached_phones.get(phone, []),
+            }
+        )
 
     report = {
         "scan_domain": domain,
@@ -600,6 +713,7 @@ def save_results(
     if not output_path:
         output_path = f"{base}-{timestamp}.{fmt}"
 
+    logger.info("Saving results to %s...", output_path)
     if fmt == "json":
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2)
@@ -621,7 +735,14 @@ def save_results(
                     ]
                 )
             for item in phones:
-                writer.writerow(["phone", item["phone"], item["source"], ""])
+                writer.writerow(
+                    [
+                        "phone",
+                        item["phone"],
+                        item["source"],
+                        ", ".join(item["breaches"]),
+                    ]
+                )
     elif fmt == "md":
         lines = [f"# Scan Report for {domain}", ""]
         lines.append("## Subdomains")
@@ -637,16 +758,19 @@ def save_results(
                 f"| {item['email']} | {item['source']} | {breaches} |")
         lines.append("")
         lines.append("## Phones")
-        lines.append("| Phone | Source |")
-        lines.append("| --- | --- |")
+        lines.append("| Phone | Source | Breaches |")
+        lines.append("| --- | --- | --- |")
         for item in phones:
-            lines.append(f"| {item['phone']} | {item['source']} |")
+            breaches = ", ".join(item["breaches"])
+            lines.append(
+                f"| {item['phone']} | {item['source']} | {breaches} |")
         with open(output_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
     else:
         raise ValueError(f"Unknown format: {fmt}")
 
-    logger.info("Results written to %s", output_path)
+    logger.debug("Results successfully saved to %s", output_path)
+
     return output_path
 
 # ---------------------- High level scan function ----------------------
@@ -656,6 +780,7 @@ async def scan_domain(
     domain: str,
     depth: int = 3,
     hibp_key: Optional[str] = None,
+    leakcheck_key: Optional[str] = None,
     *,
     verbose: bool = False,
     concurrency: int = 5,
@@ -666,11 +791,26 @@ async def scan_domain(
     phone numbers directly so callers like the microservice can easily
     serialize the data as JSON.
     """
-    if verbose:
-        logger.debug("Enumerating subdomains for %s", domain)
-    logger.info("Scanning %s at depth %d", domain, depth)
+    start_time = time.time()
+    logger.info(
+        "Starting scan for %s (depth: %d, concurrency: %d)",
+        domain,
+        depth,
+        concurrency,
+    )
+
+    stage = 1
+    logger.info("Stage %d: Enumerating subdomains for %s", stage, domain)
     subs = enumerate_subdomains(domain)
-    subdomain_schemes = filter_accessible_subdomains(subs)
+
+    stage += 1
+    logger.info(
+        "Stage %d: Filtering %d subdomains for web accessibility...",
+        stage,
+        len(subs),
+    )
+    subdomain_schemes = await filter_accessible_subdomains(subs, concurrency=concurrency)
+    logger.info("Found %d accessible web hosts.", len(subdomain_schemes))
     if verbose:
         logger.debug(
             "%d of %d subdomains are accessible", len(
@@ -683,15 +823,21 @@ async def scan_domain(
     if use_katana and verbose:
         logger.debug("Using katana for deep enumeration")
     if use_katana:
-        logger.info("katana available; using for enumeration")
+        logger.info("Using Katana crawler.")
     else:
-        logger.info("katana not available; using internal crawler only")
+        logger.info("Using internal Python crawler (Katana not found).")
 
     crawler = Crawler(
         domain, max_depth=0 if use_katana else depth, concurrency=concurrency)
 
+    stage += 1
+    logger.info(
+        "Stage %d: Crawling %d URL(s) to find contacts...",
+        stage,
+        len(subdomain_schemes),
+    )
+
     for sub, scheme in subdomain_schemes.items():
-        scheme = choose_scheme(sub)
         start_url = f"{scheme}://{sub}"
         if verbose:
             logger.debug("Crawling %s", start_url)
@@ -705,13 +851,29 @@ async def scan_domain(
         else:
             await crawler.crawl(start_url)
 
+    logger.info(
+        "Crawl phase complete. Found %d emails and %d phone numbers.",
+        len(crawler.emails),
+        len(crawler.phones),
+    )
+
+    stage += 1
     breached_emails = {}
-    logger.info("Preparing to check %d emails with HIBP", len(crawler.emails))
+    logger.info("Stage %d: Checking %d emails for breaches via HIBP...",
+                stage, len(crawler.emails))
     for email in crawler.emails.values():
-        logger.info("Calling check_hibp for: %s", email)
         breaches = check_hibp(email, hibp_key)
         if breaches:
             breached_emails[email] = breaches
+
+    stage += 1
+    breached_phones = {}
+    logger.info("Stage %d: Checking %d phone numbers for breaches via LeakCheck...",
+                stage, len(crawler.phones))
+    for phone in crawler.phones.values():
+        breaches = check_leakcheck_phone(phone, leakcheck_key)
+        if breaches:
+            breached_phones[phone] = breaches
 
     results = {
         "crawler": crawler,
@@ -719,9 +881,13 @@ async def scan_domain(
         "emails": set(crawler.emails.values()),
         "phones": set(crawler.phones.values()),
         "breached_emails": breached_emails,
+        "breached_phones": breached_phones,
         "email_sources": crawler.email_sources,
         "phone_sources": crawler.phone_sources,
     }
+
+    duration = time.time() - start_time
+    results["scan_duration"] = duration
 
     return results
 
@@ -797,13 +963,18 @@ async def main() -> dict:
     if not valid:
         logger.error(msg)
         sys.exit(1)
+    else:
+        logger.debug("Domain %s is valid and resolvable.", domain_norm)
 
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
+    leak_key = os.environ.get(
+        "LEAKCHECK_API_KEY") or cfg.get("leakcheck_api_key")
 
     results = await scan_domain(
         domain_norm,
         args.depth,
         hibp_key,
+        leak_key,
         verbose=args.verbose,
         concurrency=args.concurrency,
     )
@@ -817,13 +988,21 @@ async def main() -> dict:
 
     save_results(results, domain_norm, fmt=fmt, output_path=args.output)
 
+    logging.info("%s", "=" * 60)
     logging.info(
-        "SCAN: Scan completed for %s with %d breached emails of %d emails and %d phones",
+        "Scan Complete for %s in %.2f seconds.",
         domain_norm,
-        len(results["breached_emails"]),
-        len(results["emails"]),
-        len(results["phones"]),
+        results.get("scan_duration", 0.0),
     )
+    logging.info(
+        "Summary: Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
+        len(results["subdomains"]),
+        len(results["emails"]),
+        len(results["breached_emails"]),
+        len(results["phones"]),
+        len(results.get("breached_phones", {})),
+    )
+    logging.info("%s", "=" * 60)
 
     return results
 

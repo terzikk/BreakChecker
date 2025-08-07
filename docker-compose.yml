@@ -6,4 +6,5 @@ services:
       - "8000:8000"
     environment:
       - HIBP_API_KEY=${HIBP_API_KEY}
+      - LEAKCHECK_API_KEY=${LEAKCHECK_API_KEY}
       - CRAWL_DEPTH=${CRAWL_DEPTH:-3}

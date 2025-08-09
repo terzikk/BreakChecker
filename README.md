@@ -13,9 +13,8 @@ The scanner runs in several distinct stages:
    to free services like crt.sh, HackerTarget and Anubis DB.
 2. **Check accessibility** – each discovered subdomain is probed for HTTP/HTTPS
    support so only reachable hosts are crawled.
-3. **Crawl the site** – if the `katana` crawler is installed it is used for
-   deeper enumeration, otherwise an internal asynchronous crawler collects pages
-   with Playwright. Links and scripts are followed up to the configured depth.
+3. **Crawl the site** – an internal asynchronous crawler collects pages with
+   Playwright. Links and scripts are followed up to the configured depth.
 4. **Extract contacts** – emails and phone numbers are validated, normalized and
    stored together with the page on which they were seen.
 5. **Breach lookups** – emails are checked via a HaveIBeenPwned proxy API and
@@ -32,9 +31,9 @@ Install the pinned Python requirements:
 pip install -r requirements.txt
 ```
 
-Some stages optionally use external tools (``subfinder`` and ``katana``). They
-are installed automatically in the provided Docker image, but you can also
-install them manually for the CLI.
+Some stages optionally use the external tool ``subfinder``. It is installed
+automatically in the provided Docker image, but you can also install it manually
+for the CLI.
 
 ## Configuration
 

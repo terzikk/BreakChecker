@@ -10,9 +10,7 @@ are loaded from ``config.json`` if present, falling back to environment variable
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
 
 Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
-``crawl_depth`` to avoid setting environment variables each run. If the
-``katana`` command is available it will be used for deeper and faster crawling. Katana
-collects additional URLs which are then processed by this script.
+``crawl_depth`` to avoid setting environment variables each run.
 
 Command line options:
   -d, --depth        Maximum crawl depth
@@ -331,58 +329,6 @@ async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int
 
     logger.info("Accessible subdomains: %d of %d", len(live), len(subdomains))
     return live
-
-
-def gather_with_katana(start_url: str, depth: int) -> Set[str]:
-    """Run katana and return discovered URLs only."""
-    if not shutil.which("katana"):
-        return set()
-
-    urls: Set[str] = set()
-
-    cmd = [
-        "katana",
-        "-u",
-        start_url,
-        "-d",
-        str(depth),
-        "-silent",
-        "-j",
-    ]
-
-    try:
-        logger.info("Running katana against %s", start_url)
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                logger.debug("katana non-json line: %s", line)
-                continue
-
-            endpoint = (
-                data.get("url")
-                or data.get("request", {}).get("endpoint")
-                or start_url
-            )
-            if endpoint not in urls:
-                urls.add(endpoint)
-                logger.debug("katana scanned %s", endpoint)
-
-        proc.wait(timeout=60 * depth)
-        logger.debug("katana found %d urls", len(urls))
-    except Exception as exc:
-        logger.warning("katana execution failed: %s", exc)
-
-    return urls
 
 
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
@@ -935,16 +881,9 @@ async def scan_domain(
         for sub in sorted(subdomain_schemes):
             logger.debug(" [+] %s", sub)
 
-    use_katana = shutil.which("katana") is not None
-    if use_katana and verbose:
-        logger.debug("Using katana for deep enumeration")
-    if use_katana:
-        logger.info("Using Katana crawler.")
-    else:
-        logger.info("Using internal Python crawler (Katana not found).")
+    logger.info("Using internal Python crawler.")
 
-    crawler = Crawler(
-        domain, max_depth=0 if use_katana else depth, concurrency=concurrency)
+    crawler = Crawler(domain, max_depth=depth, concurrency=concurrency)
 
     stage += 1
     logger.info(
@@ -958,14 +897,7 @@ async def scan_domain(
         if verbose:
             logger.debug("Crawling %s", start_url)
         logger.info("Starting crawl at %s", start_url)
-        if use_katana:
-            urls = gather_with_katana(start_url, depth)
-            if not urls:
-                urls = {start_url}
-            for link in urls:
-                await crawler.crawl(link)
-        else:
-            await crawler.crawl(start_url)
+        await crawler.crawl(start_url)
 
     logger.info(
         "Crawl phase complete. Found %d emails and %d phone numbers.",

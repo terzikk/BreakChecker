@@ -59,7 +59,7 @@ The crawler reads its settings from environment variables or an optional
 
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
-# optional: export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
+export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
 python break_checker.py example.com -d 2 -c 5 -v --json
 ```
 
@@ -85,7 +85,7 @@ server with:
 
 ```bash
 export HIBP_API_KEY=YOUR_HIBP_KEY
-export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY  # optional
+export LEAKCHECK_API_KEY=YOUR_LEAKCHECK_KEY
 python manage.py runserver
 ```
 

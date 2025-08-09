@@ -54,11 +54,23 @@ from email_validator import validate_email, EmailNotValidError
 import socket
 
 
+import logging
+import os
+import sys
+from logging.handlers import RotatingFileHandler
+
+
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure root logging and return module logger."""
+    """Configure root logging and return module logger with `.log` backups."""
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     root_logger = logging.getLogger()
-    # Remove all handlers before adding new ones to avoid duplicates
+
+    # Prevent reconfiguration if already set up
+    if getattr(configure_logging, "_configured", False):
+        root_logger.setLevel(level)
+        return logging.getLogger(__name__)
+
+    # Clear existing handlers to avoid duplicates
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
 
@@ -67,17 +79,45 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # File handler with larger size & more backups
     file_handler = RotatingFileHandler(
-        log_file, maxBytes=1_000_000, backupCount=3)
+        log_file,
+        maxBytes=10_000_000,  # 10 MB
+        backupCount=10,
+        encoding="utf-8",
+        delay=True
+    )
+
+    # Rename backups to keep `.log` at the end
+    def namer(default_name):
+        base, ext = os.path.splitext(log_file)
+        # Extract rotation number from default name (e.g., ".1")
+        parts = default_name.split(".")
+        if parts[-1].isdigit():
+            return f"{base}_{parts[-1]}{ext}"
+        return default_name
+    file_handler.namer = namer
+
+    file_handler.setFormatter(formatter)
+
+    # Console handler (UTF-8 safe)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
 
-    for handler in (file_handler, stream_handler):
-        handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
-
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
     root_logger.setLevel(level)
-    # Verbose HTTP connection logs when debugging
-    logging.getLogger("urllib3").setLevel(level)
+
+    # Reduce noise
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+
+    configure_logging._configured = True
     return logging.getLogger(__name__)
 
 
@@ -272,7 +312,7 @@ async def choose_scheme(session: aiohttp.ClientSession, host: str) -> Optional[s
     return None
 
 
-async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int = 20) -> Dict[str, str]:
+async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int = 5) -> Dict[str, str]:
     """Return mapping of reachable subdomains to their scheme using asynchronous probes."""
     live: Dict[str, str] = {}
     timeout = aiohttp.ClientTimeout(total=5)
@@ -345,20 +385,58 @@ def gather_with_katana(start_url: str, depth: int) -> Set[str]:
     return urls
 
 
-async def fetch_url(session, url: str) -> Optional[str]:
-    """Fetch a URL using Playwright (for JavaScript-rendered content)."""
+async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    """Fetch a URL, rendering JS only for HTML pages. Skip PDFs/binaries."""
     try:
-        logger.debug("Launching browser to fetch %s...", url)
+        # Quick path-based skip (cheap)
+        if should_skip_url_by_path(url):
+            logger.debug("Skipping non-HTML by extension: %s", url)
+            return None
+
+        # HEAD sniff: decide how to fetch
+        content_type = None
+        try:
+            async with session.head(url, allow_redirects=True, timeout=10) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+        except Exception as exc:
+            logger.debug(
+                "HEAD failed for %s (%s); will attempt GET/Playwright", url, exc)
+
+        if content_type and not is_probably_html(content_type):
+            # If it's textual but not HTML, fetch as text; otherwise skip
+            if content_type.lower().startswith("text/") or content_type.lower().startswith("application/javascript"):
+                try:
+                    async with session.get(url, allow_redirects=True, timeout=20) as resp:
+                        if resp.status < 400:
+                            text = await resp.text(errors="replace")
+                            logger.debug(
+                                "Fetched text asset (non-HTML): %s", url)
+                            return text
+                except Exception as exc:
+                    logger.debug("GET failed for text asset %s: %s", url, exc)
+            else:
+                logger.debug(
+                    "Skipping non-HTML by Content-Type (%s): %s", content_type, url)
+                return None
+
+        # Use Playwright only for HTML pages (JS rendering)
+        logger.debug("Launching browser to fetch (HTML): %s", url)
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, timeout=20000)
-            content = await page.content()
-            await browser.close()
-            return content
+            try:
+                page = await browser.new_page()
+                # Faster and less strict than waiting for full "load"
+                await page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                content = await page.content()
+                return content
+            finally:
+                await browser.close()
+
     except Exception as e:
-        logger.warning("Playwright error at %s: %s", url, e)
+        # Keep URL printable even with non-ASCII chars; logger is UTF-8 safe now
+        logger.warning("Playwright/text fetch error at %s: %s", url, e)
         return None
+
 
 # Common file extensions that should not be treated as valid email TLDs.  These
 # often appear in asset paths like ``image@2x.png`` and can be misdetected as
@@ -392,6 +470,30 @@ EMAIL_RE = re.compile(
     + r")\b)[a-zA-Z]{2,}"
 )
 PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
+
+# URLs we should not render with a browser
+NON_HTML_EXTS = {
+    "pdf", "zip", "gz", "bz2", "xz", "7z", "rar", "exe", "msi", "dmg", "iso",
+    "png", "jpg", "jpeg", "gif", "svg", "bmp", "webp", "ico",
+    "mp3", "mp4", "m4a", "aac", "wav", "flac", "ogg", "webm",
+    "avi", "mov", "mkv",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+}
+
+
+def should_skip_url_by_path(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    if "." in path:
+        ext = path.rsplit(".", 1)[-1]
+        return ext in NON_HTML_EXTS
+    return False
+
+
+def is_probably_html(content_type: str) -> bool:
+    if not content_type:
+        return False
+    ct = content_type.lower().split(";")[0].strip()
+    return ct in ("text/html", "application/xhtml+xml")
 
 
 def normalize_email(email: str) -> Optional[str]:
@@ -538,18 +640,32 @@ class Crawler:
                     logger.debug("Discovered script %s", src)
 
     def extract_data(self, text: str, url: str):
-        """Pull data of interest out of page text."""
+        """Pull data of interest out of page text and log counts of valid items."""
+        # Snapshot counts before processing this chunk of text
+        before_emails = len(self.emails)
+        before_phones = len(self.phones)
+
         email_matches = list(EMAIL_RE.finditer(text))
         phone_matches = list(PHONE_RE.finditer(text))
+
         for m in email_matches:
             snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
             self.add_email(m.group(), url, snippet)
+
         for m in phone_matches:
             snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
             self.add_phone(m.group(), url, snippet)
-        if email_matches or phone_matches:
+
+        # Compute how many NEW, valid, deduped items we actually kept
+        new_emails = len(self.emails) - before_emails
+        new_phones = len(self.phones) - before_phones
+
+        # Only log when something new was added (and only at DEBUG level)
+        if (new_emails > 0 or new_phones > 0) and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "Extracted %d emails and %d phones", len(
+                "Extracted %d valid email(s) and %d valid phone(s) from %s "
+                "(raw matches: %d email, %d phone)",
+                new_emails, new_phones, url, len(
                     email_matches), len(phone_matches)
             )
 

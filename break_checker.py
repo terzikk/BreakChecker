@@ -4,13 +4,13 @@ Usage:
   python3 break_checker.py [options] domain
 
 The script now accepts command line arguments. API credentials and crawl depth
-are loaded from ``config.json`` if present, falling back to environment variables:
+are loaded from `config.json if present, falling back to environment variables:
 
   HIBP_API_KEY   - HaveIBeenPwned API key
   CRAWL_DEPTH    - Maximum crawl depth (default 3)
 
-Create ``config.json`` in the same directory with keys ``hibp_api_key`` and
-``crawl_depth`` to avoid setting environment variables each run.
+Create `config.json in the same directory with keys hibp_api_key and
+crawl_depth to avoid setting environment variables each run.
 
 Command line options:
   -d, --depth        Maximum crawl depth
@@ -25,8 +25,7 @@ Command line options:
 # contact information such as emails and phone numbers, and optionally checks
 # discovered emails against public breach data. Emails are deduplicated
 # case-insensitively but saved exactly as found. Phone numbers are validated
-# and stored in a normalized E.164 format for easier processing.
-
+# and stored in a normalized local/national digits-only form for easier processing.
 
 import os
 import re
@@ -47,10 +46,9 @@ import shutil
 import subprocess
 from typing import Set, List, Optional, Dict, Tuple
 import aiohttp
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PWError
 from email_validator import validate_email, EmailNotValidError
 import socket
-
 
 import logging
 import os
@@ -59,7 +57,7 @@ from logging.handlers import RotatingFileHandler
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure root logging and return module logger with `.log` backups."""
+    """Configure root logging and return module logger with .log backups."""
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     root_logger = logging.getLogger()
 
@@ -86,7 +84,7 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
         delay=True
     )
 
-    # Rename backups to keep `.log` at the end
+    # Rename backups to keep .log at the end
     def namer(default_name):
         base, ext = os.path.splitext(log_file)
         # Extract rotation number from default name (e.g., ".1")
@@ -120,11 +118,6 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
 
 
 logger = configure_logging()
-
-
-# Standard library modules provide URL handling and queues while
-# requests/BeautifulSoup handle HTTP fetching and parsing. "subprocess" is
-# used to call external enumeration tools when available.
 
 # ---------------------- Helper functions ----------------------
 
@@ -199,7 +192,7 @@ def validate_domain(user_input: str, *, check_dns: bool = True) -> Tuple[bool, s
 def enumerate_subdomains(domain: str) -> Set[str]:
     """Enumerate subdomains using subfinder if available or multiple free sources as fallback.
 
-    Wildcard entries like ``*.example.com`` are stripped of the ``*`` to avoid
+    Wildcard entries like `*.example.com are stripped of the * to avoid
     invalid hostnames being crawled.
     """
     logger.info("Enumerating subdomains for %s", domain)
@@ -295,7 +288,7 @@ def enumerate_subdomains(domain: str) -> Set[str]:
 
 
 async def choose_scheme(session: aiohttp.ClientSession, host: str) -> Optional[str]:
-    """Asynchronously return the reachable scheme for *host* or ``None`` if unreachable."""
+    """Asynchronously return the reachable scheme for *host* or `None if unreachable."""
     for scheme in ("https", "http"):
         url = f"{scheme}://{host}"
         try:
@@ -331,8 +324,52 @@ async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int
     return live
 
 
+async def get_stable_content(page, *, total_ms: int = 10000) -> Optional[str]:
+    """
+    Return HTML only when navigation settles:
+    - wait for domcontentloaded (if possible)
+    - take content snapshot
+    - ensure URL doesn't change for ~200ms
+    Retries until total_ms expires.
+    """
+    deadline = time.monotonic() + total_ms / 1000.0
+    while time.monotonic() < deadline:
+        try:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=1500)
+            except PWError:
+                pass  # fine, try reading anyway
+
+            url_before = page.url
+            html = await page.content()
+            await page.wait_for_timeout(200)
+            if page.url == url_before:
+                return html
+        except PWError:
+            # page navigated during content() – back off and retry
+            await page.wait_for_timeout(250)
+    return None
+
+
+async def http_fallback(context, url: str, timeout: int = 45000) -> Optional[str]:
+    """
+    If the page never stabilizes (SPA/SSO/meta-refresh), fetch bytes directly
+    via the same browser context (cookies, redirects preserved).
+    """
+    try:
+        r = await context.request.get(url, timeout=timeout)
+        if r.ok:
+            return await r.text()
+    except Exception:
+        pass
+    return None
+
+
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Fetch a URL, rendering JS only for HTML pages. Skip PDFs/binaries."""
+    """Fetch a URL, rendering JS only for HTML pages. Skip PDFs/binaries.
+       Uses a stabilization loop and an HTTP fallback to avoid
+       'content while navigating' Playwright errors.
+    """
     try:
         # Quick path-based skip (cheap)
         if should_skip_url_by_path(url):
@@ -370,42 +407,47 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             try:
-                page = await browser.new_page()
-                # Faster and less strict than waiting for full "load"
-                await page.goto(url, timeout=20000, wait_until="domcontentloaded")
-                content = await page.content()
-                return content
+                # Context tweaks improve stability and speed
+                context = await browser.new_context(ignore_https_errors=True, bypass_csp=True)
+                page = await context.new_page()
+
+                # Block heavy assets to speed up DOM
+                await page.route("**/*", lambda route: (
+                    route.abort() if route.request.resource_type in {
+                        "image", "media", "font"} else route.continue_()
+                ))
+
+                # Gentle first wait (commit) to avoid hanging on long loads
+                await page.goto(url, timeout=45000, wait_until="commit")
+
+                # Try to grab a stable snapshot
+                html = await get_stable_content(page, total_ms=8000)
+                if html:
+                    return html
+
+                # If still unstable (e.g., redirect loop), try HTTP fallback
+                html = await http_fallback(context, page.url)
+                if html:
+                    return html
+
+                # Last-ditch: try one more quick content read
+                try:
+                    return await page.content()
+                except PWError:
+                    return None
             finally:
                 await browser.close()
 
     except Exception as e:
-        # Keep URL printable even with non-ASCII chars; logger is UTF-8 safe now
         logger.warning("Playwright/text fetch error at %s: %s", url, e)
         return None
 
 
-# Common file extensions that should not be treated as valid email TLDs.  These
-# often appear in asset paths like ``image@2x.png`` and can be misdetected as
+# Common file extensions that should not be treated as valid email TLDs.
 EMAIL_IGNORE_EXTS = (
-    "png",
-    "jpg",
-    "jpeg",
-    "gif",
-    "svg",
-    "bmp",
-    "webp",
-    "ico",
-    "css",
-    "js",
-    "json",
-    "xml",
-    "csv",
-    "txt",
-    "pdf",
-    "doc",
-    "docx",
-    "xls",
-    "xlsx",
+    "png", "jpg", "jpeg", "gif", "svg", "bmp", "webp", "ico",
+    "css", "js", "json", "xml", "csv", "txt", "pdf",
+    "doc", "docx", "xls", "xlsx",
 )
 
 # Email regex with a negative lookahead so addresses ending with the above
@@ -415,6 +457,8 @@ EMAIL_RE = re.compile(
     + "|".join(EMAIL_IGNORE_EXTS)
     + r")\b)[a-zA-Z]{2,}"
 )
+
+# Allow inline numbers like "2310 013621", "(2310) 013621", "+30 2310 013621"
 PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
 
 # URLs we should not render with a browser
@@ -443,11 +487,7 @@ def is_probably_html(content_type: str) -> bool:
 
 
 def normalize_email(email: str) -> Optional[str]:
-    """Validate and normalize an email address after regex extraction.
-
-    Using ``email-validator`` catches syntactic errors and domains that do
-    not exist, providing a second layer of validation for higher accuracy.
-    """
+    """Validate and normalize an email address after regex extraction."""
     try:
         valid = validate_email(email, check_deliverability=True)
         return valid.normalized
@@ -456,18 +496,53 @@ def normalize_email(email: str) -> Optional[str]:
         return None
 
 
-def normalize_phone(phone: str) -> Optional[str]:
-    """Return the phone number in local format if it appears valid."""
-    try:
-        parsed = phonenumbers.parse(phone, None)
-        if phonenumbers.is_valid_number(parsed):
-            # Get the national significant number without spaces
-            local = phonenumbers.format_number(
-                parsed, phonenumbers.PhoneNumberFormat.NATIONAL)
-            digits_only = ''.join(filter(str.isdigit, local))
-            return digits_only
-    except phonenumbers.NumberParseException:
-        pass
+# ---------- NEW: region guessing & improved phone normalization ----------
+
+# Map common TLDs to ISO-3166 regions for phonenumbers
+_TLD_TO_REGION: Dict[str, str] = {
+    "gr": "GR", "us": "US", "uk": "GB", "gb": "GB", "de": "DE", "fr": "FR",
+    "it": "IT", "es": "ES", "pt": "PT", "nl": "NL", "be": "BE", "se": "SE",
+    "no": "NO", "fi": "FI", "dk": "DK", "pl": "PL", "cz": "CZ", "sk": "SK",
+    "hu": "HU", "ro": "RO", "bg": "BG", "at": "AT", "ch": "CH", "ie": "IE",
+    "tr": "TR", "ua": "UA", "ru": "RU", "il": "IL", "ca": "CA", "au": "AU",
+    "nz": "NZ", "mx": "MX", "br": "BR", "ar": "AR", "cl": "CL", "co": "CO",
+    "za": "ZA", "in": "IN", "sg": "SG", "hk": "HK", "tw": "TW", "jp": "JP",
+    "kr": "KR", "my": "MY", "id": "ID", "th": "TH", "ph": "PH", "vn": "VN",
+}
+
+
+def _guess_region_from_domain(domain: str) -> Optional[str]:
+    tld = domain.rsplit(".", 1)[-1].lower()
+    return _TLD_TO_REGION.get(tld)
+
+
+def normalize_phone(phone: str, default_region: Optional[str] = None) -> Optional[str]:
+    """
+    Return the phone number in national digits-only if it appears valid.
+    Tries E.164 (+...) and then a default region (e.g., 'GR' for .gr sites).
+    """
+    raw = phone.strip()
+
+    # Decide attempt order
+    if raw.startswith("+"):
+        try_order: List[Optional[str]] = [
+            None, default_region]  # None => E.164
+    else:
+        try_order = [default_region, None]
+
+    for region in try_order:
+        if region is None and not raw.startswith("+"):
+            # Skip E.164 attempt if there is no '+' prefix
+            continue
+        try:
+            parsed = phonenumbers.parse(raw, region)
+            if phonenumbers.is_valid_number(parsed):
+                national = phonenumbers.format_number(
+                    parsed, phonenumbers.PhoneNumberFormat.NATIONAL
+                )
+                return "".join(ch for ch in national if ch.isdigit())
+        except phonenumbers.NumberParseException:
+            pass
     return None
 
 
@@ -489,6 +564,9 @@ class Crawler:
         # Maps for the first seen location of each item
         self.email_sources: dict[str, str] = {}
         self.phone_sources: dict[str, str] = {}
+
+        # NEW: infer default phone region from the site's TLD (e.g., .gr -> GR)
+        self.default_region: Optional[str] = _guess_region_from_domain(domain)
 
         logger.debug(
             "Initializing internal crawler for https://%s", domain
@@ -516,8 +594,7 @@ class Crawler:
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
         """Store phone and log once unless verbose."""
-        norm = normalize_phone(phone)
-
+        norm = normalize_phone(phone, self.default_region)
         if norm:
             trimmed_snippet = " ".join(snippet.strip().split())
             is_new = norm not in self.phones
@@ -561,14 +638,23 @@ class Crawler:
         soup = BeautifulSoup(content, "html.parser")
         # also search the rendered text for emails split by HTML tags
         self.extract_data(soup.get_text(" "), url)
-        # capture mailto: links explicitly (case-insensitive)
+
+        # capture mailto: and tel: links explicitly (case-insensitive)
         for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.lower().startswith("mailto:"):
+            href = a["href"].strip()
+            low = href.lower()
+            if low.startswith("mailto:"):
                 addr = href.split(":", 1)[1].split("?", 1)[0].strip()
                 if addr:
                     snippet = f"mailto:{addr}"
                     self.add_email(addr, url, snippet)
+            elif low.startswith("tel:"):
+                num = href.split(":", 1)[1].split("?", 1)[0].strip()
+                if num:
+                    snippet = a.get_text(" ", strip=True) or href
+                    self.add_phone(num, url, snippet)
+
+        # follow in-scope links
         for link in soup.find_all("a", href=True):
             new_url = urljoin(url, link["href"])
             parsed = urlparse(new_url)
@@ -670,7 +756,7 @@ def check_leakcheck_phone(phone: str, api_key: Optional[str]) -> Optional[List[s
     if not api_key:
         return None
 
-    # Enforce a local rate limit of 3 queries per second
+    # Enforce a local rate limit of ~3 queries per 1.2s window
     now = time.time()
     while _leakcheck_recent and now - _leakcheck_recent[0] >= 1.2:
         _leakcheck_recent.popleft()

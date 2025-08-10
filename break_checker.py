@@ -518,8 +518,9 @@ def _guess_region_from_domain(domain: str) -> Optional[str]:
 
 def normalize_phone(phone: str, default_region: Optional[str] = None) -> Optional[str]:
     """
-    Return the phone number in national digits-only if it appears valid.
-    Tries E.164 (+...) and then a default region (e.g., 'GR' for .gr sites).
+    Return the phone number in national digits-only if it appears valid and
+    has at least 7 digits. Tries E.164 (+...) and then a default region
+    (e.g., 'GR' for .gr sites).
     """
     raw = phone.strip()
 
@@ -540,7 +541,9 @@ def normalize_phone(phone: str, default_region: Optional[str] = None) -> Optiona
                 national = phonenumbers.format_number(
                     parsed, phonenumbers.PhoneNumberFormat.NATIONAL
                 )
-                return "".join(ch for ch in national if ch.isdigit())
+                digits = "".join(ch for ch in national if ch.isdigit())
+                if len(digits) >= 7:  # ignore short codes
+                    return digits
         except phonenumbers.NumberParseException:
             pass
     return None
@@ -634,6 +637,10 @@ class Crawler:
         if not content:
             return
         logger.debug("Extracting contact data from %s", url)
+        parsed_url = urlparse(url)
+        if parsed_url.path.lower().endswith(('.js', '.mjs')):
+            self.extract_data(content, url, allow_phones=False)
+            return
         self.extract_data(content, url)
         soup = BeautifulSoup(content, "html.parser")
         # also search the rendered text for emails split by HTML tags
@@ -671,14 +678,14 @@ class Crawler:
                     queue.append((src, depth + 1))
                     logger.debug("Discovered script %s", src)
 
-    def extract_data(self, text: str, url: str):
+    def extract_data(self, text: str, url: str, *, allow_phones: bool = True):
         """Pull data of interest out of page text and log counts of valid items."""
         # Snapshot counts before processing this chunk of text
         before_emails = len(self.emails)
         before_phones = len(self.phones)
 
         email_matches = list(EMAIL_RE.finditer(text))
-        phone_matches = list(PHONE_RE.finditer(text))
+        phone_matches = list(PHONE_RE.finditer(text)) if allow_phones else []
 
         for m in email_matches:
             snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")

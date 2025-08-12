@@ -46,7 +46,7 @@ from email_validator import validate_email, EmailNotValidError
 import socket
 import errno
 import ssl
-
+import tldextract
 
 # ---------------------- Logging ----------------------
 
@@ -637,19 +637,54 @@ class Crawler:
         self.email_sources: Dict[str, str] = {}
         self.phone_sources: Dict[str, str] = {}
         self.default_region: Optional[str] = _guess_region_from_domain(domain)
-        logger.debug("Initializing internal crawler for https://%s", domain)
+
+        # --- org-scope email filtering setup (tldextract) ---
+        self._tld = tldextract.TLDExtract(
+            cache_dir=None, suffix_list_urls=None)
+        _ext = self._tld(domain)
+        self._org = _ext.top_domain_under_public_suffix
+        self._emails_kept = 0
+        self._emails_dropped = 0
+        logger.debug(
+            "Initializing internal crawler for https://%s (org=%s)",
+            domain, self._org or "?"
+        )
 
     def add_email(self, email: str, source: str, snippet: str = "") -> None:
+        """Store email (org-scope filtered) and log discovery once unless verbose."""
         canon = normalize_email(email)
         if not canon:
             return
+
+        # org-scope filter: keep iff registered_domain(email) == registered_domain(target)
+        try:
+            domain_part = canon.rsplit("@", 1)[-1]
+            e_ext = self._tld(domain_part)
+            email_org = e_ext.top_domain_under_public_suffix
+        except Exception as exc:
+            self._emails_dropped += 1
+            logger.debug("Dropping email (parse error): %s (%s)", email, exc)
+            return
+
+        keep = bool(email_org) and (email_org == self._org)
+        if not keep:
+            self._emails_dropped += 1
+            logger.debug(
+                "Dropping non-org email: %s (email_org=%s, target_org=%s, source=%s)",
+                canon, email_org, self._org, source
+            )
+            return
+
+        # kept: identical INFO logs as before
         is_new = canon not in self.emails
         if is_new:
             self.emails[canon] = canon
             self.email_sources[canon] = source
+            self._emails_kept += 1
             logger.info("Found email: %s (source: %s)", canon, source)
         else:
             logger.debug("Duplicate email: %s (new source: %s)", canon, source)
+
         if logger.isEnabledFor(logging.DEBUG) and snippet:
             logger.debug("Email snippet: %s",
                          " ".join(snippet.strip().split()))
@@ -746,7 +781,8 @@ class Crawler:
 
         if allow_phones:
             for m in PHONE_RE.finditer(text):
-                snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
+                snippet = text[max(m.start()-20, 0)
+                                   : m.end()+20].replace("\n", " ")
                 self.add_phone(m.group(), url, snippet)
 
         new_emails = len(self.emails) - before_emails
@@ -990,6 +1026,9 @@ async def scan_domain(
 
     logger.info("Crawl phase complete. Found %d emails and %d phone numbers.", len(
         crawler.emails), len(crawler.phones))
+    logger.debug("Email filter (org) stats: kept=%d, dropped=%d",
+                 getattr(crawler, "_emails_kept", 0),
+                 getattr(crawler, "_emails_dropped", 0))
 
     stage += 1
     breached_emails: Dict[str, List[str]] = {}

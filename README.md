@@ -72,6 +72,8 @@ Each argument configures how the scan is performed:
 - `--csv` – save results to `DOMAIN-TIMESTAMP.csv`
 - `--md`, `--report` – save results to `DOMAIN-TIMESTAMP.md`
 - `-o`, `--output` – optional custom path for the report file
+- `--email-scope` – filter collected emails: `host` (target domain and subdomains),
+  `org` (registered domain, default) or `any` (no filtering)
 
 Logs are written to `break_checker.log` in the working directory and printed on
 the console. Set the `BREACH_LOG_FILE` environment variable to change the log

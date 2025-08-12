@@ -20,6 +20,8 @@ Command line options:
   --csv               Save results as DOMAIN-TIMESTAMP.csv
   --md, --report      Save results as DOMAIN-TIMESTAMP.md
   -c, --concurrency   Number of concurrent workers
+  --email-scope {host,org,any}
+                       Email filtering scope (default: org)
 """
 
 import os
@@ -46,6 +48,7 @@ from email_validator import validate_email, EmailNotValidError
 import socket
 import errno
 import ssl
+import tldextract
 
 
 # ---------------------- Logging ----------------------
@@ -627,7 +630,15 @@ def _extract_tel_numbers(href: str) -> List[str]:
 class Crawler:
     """Asynchronous breadth-first crawler limited to the target domain."""
 
-    def __init__(self, domain: str, max_depth: int = 3, concurrency: int = 5):
+    def __init__(
+        self,
+        domain: str,
+        max_depth: int = 3,
+        concurrency: int = 5,
+        *,
+        email_scope: str = "org",
+        registered_domain: Optional[str] = None,
+    ):
         self.domain = domain
         self.max_depth = max_depth
         self.concurrency = concurrency
@@ -637,11 +648,40 @@ class Crawler:
         self.email_sources: Dict[str, str] = {}
         self.phone_sources: Dict[str, str] = {}
         self.default_region: Optional[str] = _guess_region_from_domain(domain)
+        self.email_scope = email_scope
+        self.registered_domain = registered_domain
+        self.emails_kept = 0
+        self.emails_dropped = 0
         logger.debug("Initializing internal crawler for https://%s", domain)
+
+    def _email_in_scope(self, canon: str) -> Tuple[bool, str]:
+        domain_part = canon.split("@", 1)[1]
+        if self.email_scope == "any":
+            return True, "scope any"
+        if self.email_scope == "host":
+            if domain_part == self.domain or domain_part.endswith("." + self.domain):
+                return True, f"domain {domain_part} matches {self.domain}"
+            return False, f"domain {domain_part} outside host scope"
+        if self.email_scope == "org" and self.registered_domain:
+            reg = tldextract.extract(domain_part).registered_domain
+            if reg == self.registered_domain:
+                return True, f"registered domain {reg} matches {self.registered_domain}"
+            return False, f"registered domain {reg} does not match {self.registered_domain}"
+        return True, "no registered domain configured"
 
     def add_email(self, email: str, source: str, snippet: str = "") -> None:
         canon = normalize_email(email)
         if not canon:
+            return
+        keep, reason = self._email_in_scope(canon)
+        if keep:
+            self.emails_kept += 1
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Keeping email %s: %s", canon, reason)
+        else:
+            self.emails_dropped += 1
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Dropping email %s: %s", canon, reason)
             return
         is_new = canon not in self.emails
         if is_new:
@@ -954,6 +994,8 @@ async def scan_domain(
     *,
     verbose: bool = False,
     concurrency: int = 5,
+    email_scope: str = "org",
+    registered_domain: Optional[str] = None,
 ) -> dict:
     """Crawl a domain and optionally check contacts against breach data."""
     start_time = time.time()
@@ -976,7 +1018,13 @@ async def scan_domain(
             logger.debug(" [+] %s", sub)
 
     logger.info("Using internal Python crawler.")
-    crawler = Crawler(domain, max_depth=depth, concurrency=concurrency)
+    crawler = Crawler(
+        domain,
+        max_depth=depth,
+        concurrency=concurrency,
+        email_scope=email_scope,
+        registered_domain=registered_domain,
+    )
 
     stage += 1
     logger.info("Stage %d: Crawling %d URL(s) to find contacts...",
@@ -990,6 +1038,11 @@ async def scan_domain(
 
     logger.info("Crawl phase complete. Found %d emails and %d phone numbers.", len(
         crawler.emails), len(crawler.phones))
+    logger.info(
+        "Email filter stats: kept %d, dropped %d",
+        crawler.emails_kept,
+        crawler.emails_dropped,
+    )
 
     stage += 1
     breached_emails: Dict[str, List[str]] = {}
@@ -1017,6 +1070,8 @@ async def scan_domain(
         "breached_phones": breached_phones,
         "email_sources": crawler.email_sources,
         "phone_sources": crawler.phone_sources,
+        "emails_kept": crawler.emails_kept,
+        "emails_dropped": crawler.emails_dropped,
     }
 
     duration = time.time() - start_time
@@ -1036,6 +1091,13 @@ def parse_args(default_depth: int) -> argparse.Namespace:
                         metavar="N", help="Number of concurrent workers")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging")
+    parser.add_argument(
+        "--email-scope",
+        choices=["host", "org", "any"],
+        default="org",
+        help=("Email filtering scope: host (target domain and subdomains), "
+              "org (registered domain), any (no filtering)")
+    )
     fmt_group = parser.add_mutually_exclusive_group()
     fmt_group.add_argument("-j", "--json", action="store_true",
                            help="Save results as DOMAIN-TIMESTAMP.json (default)")
@@ -1055,6 +1117,7 @@ async def main() -> dict:
     args = parse_args(default_depth)
 
     configure_logging(logging.DEBUG if args.verbose else logging.INFO)
+    logger.info("Email scope mode selected: %s", args.email_scope)
 
     valid, domain_norm, msg = validate_domain(args.domain, check_dns=True)
     if not valid:
@@ -1062,6 +1125,12 @@ async def main() -> dict:
         sys.exit(1)
     else:
         logger.debug("Domain %s is valid and resolvable.", domain_norm)
+
+    reg_domain = None
+    if args.email_scope in ("host", "org"):
+        reg_domain = tldextract.extract(domain_norm).registered_domain
+        logger.info("Target domain: %s", domain_norm)
+        logger.info("Registered domain: %s", reg_domain)
 
     hibp_key = os.environ.get("HIBP_API_KEY") or cfg.get("hibp_api_key")
     leak_key = os.environ.get(
@@ -1074,6 +1143,8 @@ async def main() -> dict:
         leak_key,
         verbose=args.verbose,
         concurrency=args.concurrency,
+        email_scope=args.email_scope,
+        registered_domain=reg_domain,
     )
 
     if args.csv:

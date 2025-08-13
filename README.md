@@ -102,10 +102,15 @@ Example response:
 ```json
 {
   "domain": "example.com",
+  "scan_start": "2024-01-01 12:00:00",
+  "scan_end": "2024-01-01 12:00:10",
   "summary": {
+    "num_endpoints": 42,
     "num_subdomains": 3,
     "num_emails": 2,
+    "num_invalid_emails": 1,
     "num_phones": 1,
+    "num_invalid_phones": 0,
     "num_breached_emails": 1,
     "num_breached_phones": 1
   },

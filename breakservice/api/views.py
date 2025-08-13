@@ -34,12 +34,15 @@ class ScanView(APIView):
                 domain, depth, hibp_key, leak_key)
 
             logging.info(
-                "SCAN: Scan completed with %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
+                "SCAN: Scan completed with %d endpoints, %d subdomains, %d emails (%d breached, %d dropped), and %d phones (%d breached, %d dropped).",
+                results.get("num_endpoints", 0),
                 len(results["subdomains"]),
                 len(results["emails"]),
                 len(results["breached_emails"]),
+                results.get("emails_dropped", 0),
                 len(results["phones"]),
                 len(results.get("breached_phones", {})),
+                results.get("phones_dropped", 0),
             )
         except Exception as e:
             logging.exception("SCAN: Exception in scan_domain")
@@ -47,10 +50,15 @@ class ScanView(APIView):
 
         payload = {
             "domain": domain,
+            "scan_start": results.get("scan_start"),
+            "scan_end": results.get("scan_end"),
             "summary": {
+                "num_endpoints": results.get("num_endpoints", 0),
                 "num_subdomains": len(results["subdomains"]),
                 "num_emails": len(results["emails"]),
+                "num_invalid_emails": results.get("emails_dropped", 0),
                 "num_phones": len(results["phones"]),
+                "num_invalid_phones": results.get("phones_dropped", 0),
                 "num_breached_emails": len(results["breached_emails"]),
                 "num_breached_phones": len(results.get("breached_phones", {})),
             },

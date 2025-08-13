@@ -645,6 +645,8 @@ class Crawler:
         self._org = _ext.top_domain_under_public_suffix
         self._emails_kept = 0
         self._emails_dropped = 0
+        self._phones_kept = 0
+        self._phones_dropped = 0
         logger.debug(
             "Initializing internal crawler for https://%s (org=%s)",
             domain, self._org or "?"
@@ -696,6 +698,7 @@ class Crawler:
             if is_new:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
+                self._phones_kept += 1
                 logger.info("Found phone: %s (source: %s)", norm, source)
             else:
                 logger.debug(
@@ -703,6 +706,9 @@ class Crawler:
             if logger.isEnabledFor(logging.DEBUG) and snippet:
                 logger.debug("Phone snippet: %s",
                              " ".join(snippet.strip().split()))
+        else:
+            self._phones_dropped += 1
+            logger.debug("Dropping invalid phone: %s", phone)
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
@@ -921,9 +927,23 @@ def save_results(
             }
         )
 
+    summary = {
+        "num_subdomains": len(results.get("subdomains", [])),
+        "num_endpoints": results.get("num_endpoints", 0),
+        "num_emails": len(results.get("emails", [])),
+        "num_phones": len(results.get("phones", [])),
+        "num_breached_emails": len(breached_emails),
+        "num_breached_phones": len(breached_phones),
+        "emails_dropped": results.get("emails_dropped", 0),
+        "phones_dropped": results.get("phones_dropped", 0),
+    }
+
     report = {
         "scan_domain": domain,
-        "scan_time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "scan_start": results.get("scan_start"),
+        "scan_end": results.get("scan_end"),
+        "scan_duration": results.get("scan_duration"),
+        "summary": summary,
         "subdomains": sorted(results.get("subdomains", [])),
         "emails": emails,
         "phones": phones,
@@ -943,6 +963,13 @@ def save_results(
         import csv
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
+            writer.writerow(["scan_start", report.get("scan_start")])
+            writer.writerow(["scan_end", report.get("scan_end")])
+            writer.writerow(["scan_duration", report.get("scan_duration")])
+            writer.writerow([])
+            for key, value in summary.items():
+                writer.writerow([key, value])
+            writer.writerow([])
             writer.writerow(["type", "value", "source", "breaches"])
             for sub in report["subdomains"]:
                 writer.writerow(["subdomain", sub, "", ""])
@@ -954,6 +981,14 @@ def save_results(
                     ["phone", item["phone"], item["source"], ", ".join(item["breaches"])])
     elif fmt == "md":
         lines = [f"# Scan Report for {domain}", ""]
+        lines.append(f"Start: {report.get('scan_start')}")
+        lines.append(f"End: {report.get('scan_end')}")
+        lines.append(f"Duration: {report.get('scan_duration')}")
+        lines.append("")
+        lines.append("## Summary")
+        for key, value in summary.items():
+            lines.append(f"- {key.replace('_', ' ')}: {value}")
+        lines.append("")
         lines.append("## Subdomains")
         for sub in report["subdomains"]:
             lines.append(f"- {sub}")
@@ -993,6 +1028,7 @@ async def scan_domain(
 ) -> dict:
     """Crawl a domain and optionally check contacts against breach data."""
     start_time = time.time()
+    start_dt = datetime.datetime.now(datetime.timezone.utc)
     logger.info("Starting scan for %s (depth: %d, concurrency: %d)",
                 domain, depth, concurrency)
 
@@ -1029,6 +1065,9 @@ async def scan_domain(
     logger.debug("Email filter (org) stats: kept=%d, dropped=%d",
                  getattr(crawler, "_emails_kept", 0),
                  getattr(crawler, "_emails_dropped", 0))
+    logger.debug("Phone filter stats: kept=%d, dropped=%d",
+                 getattr(crawler, "_phones_kept", 0),
+                 getattr(crawler, "_phones_dropped", 0))
 
     stage += 1
     breached_emails: Dict[str, List[str]] = {}
@@ -1056,10 +1095,18 @@ async def scan_domain(
         "breached_phones": breached_phones,
         "email_sources": crawler.email_sources,
         "phone_sources": crawler.phone_sources,
+        "num_endpoints": len(crawler.visited),
+        "emails_dropped": getattr(crawler, "_emails_dropped", 0),
+        "phones_dropped": getattr(crawler, "_phones_dropped", 0),
     }
 
+    end_dt = datetime.datetime.now(datetime.timezone.utc)
     duration = time.time() - start_time
     results["scan_duration"] = duration
+    # Use the same timestamp format as log messages
+    ts_format = "%Y-%m-%d %H:%M:%S"
+    results["scan_start"] = start_dt.strftime(ts_format)
+    results["scan_end"] = end_dt.strftime(ts_format)
     return results
 
 # ---------------------- CLI ----------------------
@@ -1127,13 +1174,18 @@ async def main() -> dict:
     logging.info("%s", "=" * 60)
     logging.info("Scan Complete for %s in %.2f seconds.",
                  domain_norm, results.get("scan_duration", 0.0))
+    logging.info("Scan started at %s and ended at %s",
+                 results.get("scan_start"), results.get("scan_end"))
     logging.info(
-        "Summary: Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
+        "Summary: Crawled %d endpoints, %d subdomains, %d emails (%d breached, %d dropped) and %d phones (%d breached, %d dropped).",
+        results.get("num_endpoints", 0),
         len(results["subdomains"]),
         len(results["emails"]),
         len(results["breached_emails"]),
+        results.get("emails_dropped", 0),
         len(results["phones"]),
         len(results.get("breached_phones", {})),
+        results.get("phones_dropped", 0),
     )
     logging.info("%s", "=" * 60)
     return results

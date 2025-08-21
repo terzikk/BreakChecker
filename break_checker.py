@@ -69,6 +69,7 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     enabled when no root handlers are present (i.e. CLI usage). When running
     under a web server like Gunicorn/Django, we rely on its root handlers to
     avoid duplicate console output.
+
     """
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     logger = logging.getLogger("break_checker")
@@ -76,6 +77,9 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     if getattr(configure_logging, "_configured", False):
         logger.setLevel(level)
         return logger
+
+
+    # Remove any pre-existing handlers to avoid duplicate log lines
 
     if logger.hasHandlers():
         logger.handlers.clear()
@@ -122,6 +126,7 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
         logger.propagate = False
 
     logger.setLevel(level)
+
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)

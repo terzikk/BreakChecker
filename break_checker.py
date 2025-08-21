@@ -59,30 +59,21 @@ import tldextract
 import threading
 import psutil
 
+
 # ---------------------- Logging ----------------------
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Return the shared ``break_checker`` logger.
-
-    The logger always writes to a rotating file. Console logging is only
-    enabled when no root handlers are present (i.e. CLI usage). When running
-    under a web server like Gunicorn/Django, we rely on its root handlers to
-    avoid duplicate console output.
-
-    """
+    """Configure root logging and return module logger with .log backups."""
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
-    logger = logging.getLogger("break_checker")
+    root_logger = logging.getLogger()
 
     if getattr(configure_logging, "_configured", False):
-        logger.setLevel(level)
-        return logger
+        root_logger.setLevel(level)
+        return logging.getLogger(__name__)
 
-
-    # Remove any pre-existing handlers to avoid duplicate log lines
-
-    if logger.hasHandlers():
-        logger.handlers.clear()
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
 
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
@@ -113,26 +104,18 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     except Exception:
         pass
 
-    root_has_handlers = bool(logging.getLogger().handlers)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
 
-    logger.addHandler(file_handler)
-
-    if root_has_handlers:
-        logger.propagate = True
-    else:
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        logger.addHandler(stream_handler)
-        logger.propagate = False
-
-    logger.setLevel(level)
-
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+    root_logger.setLevel(level)
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
 
     configure_logging._configured = True
-    return logger
+    return logging.getLogger(__name__)
 
 
 logger = configure_logging()
@@ -1479,12 +1462,12 @@ async def main() -> dict:
 
     save_results(results, domain_norm, fmt=fmt, output_path=args.output)
 
-    logger.info("%s", "=" * 60)
-    logger.info("Scan Complete for %s in %.2f seconds.",
-                domain_norm, results.get("scan_duration", 0.0))
-    logger.info("Scan started at %s and ended at %s",
-                results.get("scan_start"), results.get("scan_end"))
-    logger.info(
+    logging.info("%s", "=" * 60)
+    logging.info("Scan Complete for %s in %.2f seconds.",
+                 domain_norm, results.get("scan_duration", 0.0))
+    logging.info("Scan started at %s and ended at %s",
+                 results.get("scan_start"), results.get("scan_end"))
+    logging.info(
         "Summary: Crawled %d endpoints, %d subdomains, %d emails (%d breached, %d dropped) and %d phones (%d breached, %d dropped).",
         results.get("num_endpoints", 0),
         len(results["subdomains"]),
@@ -1495,7 +1478,7 @@ async def main() -> dict:
         len(results.get("breached_phones", {})),
         results.get("phones_dropped", 0),
     )
-    logger.info("%s", "=" * 60)
+    logging.info("%s", "=" * 60)
     return results
 
 

@@ -63,11 +63,13 @@ import psutil
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure and return module logger with file & console handlers.
+    """Return the shared ``break_checker`` logger.
 
-    Uses a dedicated logger so web servers like Gunicorn that configure the
-    root logger do not duplicate our messages. Subsequent calls simply adjust
-    the log level.
+    The logger always writes to a rotating file. Console logging is only
+    enabled when no root handlers are present (i.e. CLI usage). When running
+    under a web server like Gunicorn/Django, we rely on its root handlers to
+    avoid duplicate console output.
+
     """
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     logger = logging.getLogger("break_checker")
@@ -76,7 +78,9 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
         logger.setLevel(level)
         return logger
 
+
     # Remove any pre-existing handlers to avoid duplicate log lines
+
     if logger.hasHandlers():
         logger.handlers.clear()
 
@@ -109,13 +113,20 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     except Exception:
         pass
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
+    root_has_handlers = bool(logging.getLogger().handlers)
 
     logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+
+    if root_has_handlers:
+        logger.propagate = True
+    else:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+        logger.propagate = False
+
     logger.setLevel(level)
-    logger.propagate = False  # prevent messages from being handled twice
+
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)

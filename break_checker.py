@@ -31,7 +31,16 @@ import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 import time
-from urllib.parse import urljoin, urlparse, parse_qs, unquote
+from urllib.parse import (
+    urljoin,
+    urlparse,
+    parse_qs,
+    parse_qsl,
+    unquote,
+    urlencode,
+    urlunparse,
+    urldefrag,
+)
 from collections import deque
 import datetime
 import phonenumbers
@@ -47,6 +56,9 @@ import socket
 import errno
 import ssl
 import tldextract
+import threading
+import psutil
+
 
 # ---------------------- Logging ----------------------
 
@@ -107,6 +119,57 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
 
 
 logger = configure_logging()
+
+
+# ---------------------- Resource monitoring (CPU & Memory) ----------------------
+
+def _resource_monitor(samples, stop_event: threading.Event, interval: float = 1.0):
+    """
+    Background sampler for per-process CPU% and RSS memory (MB).
+    """
+    proc = psutil.Process()
+    # Prime cpu_percent for first meaningful reading
+    proc.cpu_percent(interval=None)
+    while not stop_event.is_set():
+        try:
+            samples["cpu"].append(proc.cpu_percent(interval=None))  # %
+            samples["mem"].append(proc.memory_info().rss / (1024 * 1024))  # MB
+        except Exception:
+            pass
+        stop_event.wait(interval)
+
+
+def _start_resource_monitor():
+    """
+    Start sampling and return (stop_event, thread, samples_dict).
+    """
+    samples = {"cpu": [], "mem": []}
+    stop_event = threading.Event()
+    t = threading.Thread(target=_resource_monitor,
+                         args=(samples, stop_event), daemon=True)
+    t.start()
+    return stop_event, t, samples
+
+
+def _stop_resource_monitor(stop_event: threading.Event, t: threading.Thread, samples):
+    """
+    Stop sampling and compute aggregate metrics.
+    """
+    stop_event.set()
+    t.join(timeout=2.0)
+    cpu = samples["cpu"]
+    mem = samples["mem"]
+    cpu_avg = (sum(cpu) / len(cpu)) if cpu else 0.0
+    cpu_peak = max(cpu) if cpu else 0.0
+    mem_avg = (sum(mem) / len(mem)) if mem else 0.0
+    mem_peak = max(mem) if mem else 0.0
+    return {
+        "cpu_avg": round(cpu_avg, 2),
+        "cpu_peak": round(cpu_peak, 2),
+        "mem_avg_mb": round(mem_avg, 2),
+        "mem_peak_mb": round(mem_peak, 2),
+    }
+
 
 # ---------------------- Config & domain validation ----------------------
 
@@ -387,6 +450,126 @@ def _classify_net_error(exc: Exception) -> str:
     return "other"
 
 
+# ---------- Persistent Playwright (single browser/context, NO CAP) ----------
+
+_PW = None
+_PW_BROWSER = None
+_PW_CTX = None
+
+
+async def _ensure_pw_started():
+    """Start Playwright once and create a shared context (no page cap)."""
+    global _PW, _PW_BROWSER, _PW_CTX
+    if _PW is not None:
+        return
+
+    _PW = await async_playwright().start()
+    _PW_BROWSER = await _PW.chromium.launch(headless=True)
+    _PW_CTX = await _PW_BROWSER.new_context(
+        ignore_https_errors=True,
+        bypass_csp=True
+    )
+
+    # Block heavy assets globally to keep renders fast and quiet
+    await _PW_CTX.route("**/*", lambda route: (
+        route.abort() if route.request.resource_type in {"image", "media", "font"}
+        else route.continue_()
+    ))
+
+
+async def _shutdown_pw():
+    """Cleanly close the shared Playwright resources (if started)."""
+    global _PW, _PW_BROWSER, _PW_CTX
+    try:
+        if _PW_CTX is not None:
+            await _PW_CTX.close()
+    except Exception:
+        pass
+    try:
+        if _PW_BROWSER is not None:
+            await _PW_BROWSER.close()
+    except Exception:
+        pass
+    try:
+        if _PW is not None:
+            await _PW.stop()
+    except Exception:
+        pass
+    _PW = None
+    _PW_BROWSER = None
+    _PW_CTX = None
+
+
+async def _render_with_pw(url: str) -> Optional[str]:
+    """
+    Render a URL using the shared Playwright browser/context (no cap).
+    Includes a single self-heal retry if the context/browser died under load.
+    """
+    await _ensure_pw_started()
+    assert _PW_CTX is not None
+
+    async def _once() -> Optional[str]:
+        page = await _PW_CTX.new_page()
+        try:
+            try:
+                # Faster nav; salvage on failures
+                await page.goto(url, timeout=15000, wait_until="commit")
+            except PWError as exc:
+                # salvage whatever we can
+                try:
+                    html = await page.content()
+                    if html:
+                        return html
+                except Exception:
+                    pass
+                html = await http_fallback(_PW_CTX, url)
+                if html:
+                    return html
+                logger.debug("Browser nav issue (%s) at %s",
+                             _classify_net_error(exc), url)
+                return None
+
+            html = await get_stable_content(page, total_ms=8000)
+            if html:
+                return html
+
+            html = await http_fallback(_PW_CTX, page.url)
+            if html:
+                return html
+
+            try:
+                return await page.content()
+            except PWError:
+                return None
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    # Try once
+    try:
+        html = await _once()
+        if html is not None:
+            return html
+    except PWError as exc:
+        # If the context is gone, restart once
+        msg = str(exc).lower()
+        if "closed" in msg or "target closed" in msg or "browser has been closed" in msg:
+            logger.debug("Playwright context died; restarting...")
+            await _shutdown_pw()
+            await _ensure_pw_started()
+            try:
+                return await _once()
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+    return None
+
+
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     """Fetch a URL; only render with Playwright for likely-HTML that responds.
     All failures/skips are logged at DEBUG so they don't clutter stdout."""
@@ -401,11 +584,11 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
             logger.debug("Skipping %s (host marked dead)", url)
             return None
 
-        # HEAD preflight
+        # HEAD preflight (tighter timeout)
         content_type = None
         content_disp = None
         try:
-            async with session.head(url, allow_redirects=True, timeout=10) as resp:
+            async with session.head(url, allow_redirects=True, timeout=8) as resp:
                 content_type = resp.headers.get("Content-Type", "")
                 content_disp = resp.headers.get("Content-Disposition", "")
                 if resp.status >= 400:
@@ -426,7 +609,7 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
         if content_type and not is_probably_html(content_type):
             if content_type.lower().startswith("text/") or content_type.lower().startswith("application/javascript"):
                 try:
-                    async with session.get(url, allow_redirects=True, timeout=20) as resp:
+                    async with session.get(url, allow_redirects=True, timeout=12) as resp:
                         if resp.status < 400:
                             return await resp.text(errors="replace")
                         logger.debug("Skip: GET %s returned %s",
@@ -438,7 +621,7 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
         if not content_type:
             try:
-                async with session.get(url, allow_redirects=True, timeout=15) as resp:
+                async with session.get(url, allow_redirects=True, timeout=12) as resp:
                     if resp.status >= 400:
                         logger.debug("Skip: %s returned %s on GET",
                                      url, resp.status)
@@ -455,45 +638,116 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
                     _DEAD_HOSTS.add(host)
                 return None
 
-        # Playwright only for cooperative HTML
+        # Playwright only for cooperative HTML (shared browser/context)
         logger.debug("Rendering (HTML): %s", url)
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            try:
-                context = await browser.new_context(ignore_https_errors=True, bypass_csp=True)
-                page = await context.new_page()
-                await page.route("**/*", lambda route: (
-                    route.abort() if route.request.resource_type in {
-                        "image", "media", "font"} else route.continue_()
-                ))
-                try:
-                    await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-                except PWError as exc:
-                    reason = _classify_net_error(exc)
-                    logger.debug("Browser skip: %s at %s", reason, url)
-                    if reason == "refused" and host:
-                        _DEAD_HOSTS.add(host)
-                    return None
+        return await _render_with_pw(url)
 
-                html = await get_stable_content(page, total_ms=8000)
-                if html:
-                    return html
-
-                html = await http_fallback(context, page.url)
-                if html:
-                    return html
-
-                try:
-                    return await page.content()
-                except PWError:
-                    return None
-            finally:
-                await browser.close()
     except Exception as e:
         # Unexpected exceptions only — still keep them at DEBUG per your preference
         reason = _classify_net_error(e)
         logger.debug("Fetch error (%s) at %s: %s", reason, url, e)
         return None
+
+
+# ---------------------- URL canonicalization helpers ----------------------
+
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_reader", "utm_name", "utm_place", "utm_creative",
+    "gclid", "dclid", "fbclid", "mc_cid", "mc_eid", "igshid",
+    "ref_src", "ref_url", "ref", "mkt_tok", "spm", "cn-reloaded",
+}
+TRACKING_PREFIXES = ("utm_", "_hs", "vero_")
+
+
+def _should_drop_param(k: str) -> bool:
+    k_low = k.lower()
+    if k_low in TRACKING_PARAMS:
+        return True
+    return any(k_low.startswith(p) for p in TRACKING_PREFIXES)
+
+
+def _normalize_path(path: str) -> str:
+    # Collapse multiple slashes, keep a single leading slash
+    path = re.sub(r"/{2,}", "/", path)
+    # Remove trailing slash except root
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+
+def canonicalize_url(base_url: str, link: str, *, scope_host: str) -> Optional[str]:
+    """
+    Resolve link to absolute URL, strip fragments, normalize host/path,
+    remove tracking query params, sort remaining query params.
+    Only return URLs within scope_host.
+    """
+    if not link:
+        return None
+    link = link.strip()
+    # Ignore javascript/mailto/tel here; those are handled separately elsewhere
+    if link.startswith(("javascript:", "data:", "blob:")):
+        return None
+
+    # Guard against malformed IPv6/bad hrefs raising ValueError
+    try:
+        abs_url = urljoin(base_url, link)
+        abs_url, _frag = urldefrag(abs_url)
+        parsed = urlparse(abs_url)
+    except Exception:
+        return None
+
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    # Scope check by hostname (safe) instead of netloc
+    hostname = (parsed.hostname or "").lower()
+    if not hostname.endswith(scope_host):
+        return None
+
+    # Normalize path
+    path = parsed.path or "/"
+    path = re.sub(r"/{2,}", "/", path)
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+
+    # Clean query: drop tracking, sort remaining, dedupe
+    query = ""
+    if parsed.query:
+        pairs = []
+        for k, v in parse_qsl(parsed.query, keep_blank_values=False):
+            if _should_drop_param(k):
+                continue
+            pairs.append((k, v))
+        if pairs:
+            pairs.sort(key=lambda kv: (kv[0], kv[1]))
+            query = urlencode(pairs, doseq=True)
+
+    # IPv6-safe netloc reconstruction + default-port stripping
+    port = parsed.port
+    if (parsed.scheme == "http" and port in (None, 80)) or (parsed.scheme == "https" and port in (None, 443)):
+        netloc = hostname
+    else:
+        netloc = f"{hostname}:{port}" if port else hostname
+
+    # no params, no fragment
+    return urlunparse((parsed.scheme, netloc, path, "", query, ""))
+
+
+def _url_struct_key(u: str) -> Tuple[str, str, bool]:
+    """
+    Return a canonical structural key for dedup:
+      (host, normalized_path_without_html_or_trailing_slash, has_query)
+    so /a/b, /a/b/, and /a/b.html collapse to the same key.
+    """
+    p = urlparse(u)
+    host = (p.hostname or "").lower()
+    path = (p.path or "/").rstrip("/")
+    if path.endswith(".html"):
+        path = path[:-5]
+        if not path:
+            path = "/"
+    return (host, path, bool(p.query))
 
 
 # ---------------------- Extraction helpers ----------------------
@@ -534,11 +788,9 @@ def _clean_angle_brackets(s: str) -> str:
 
 def normalize_email(email: str) -> Optional[str]:
     """Validate and normalize an email; canonical form is lower-case for dedup."""
-    # strip wrappers and decode percent encodings
     cleaned = _clean_angle_brackets(
         unquote(email.strip().strip("'").strip('"')))
     try:
-        # Lower-case entire address so case-variants collapse
         valid = validate_email(cleaned.lower(), check_deliverability=True)
         return valid.normalized.lower()
     except EmailNotValidError as exc:
@@ -579,14 +831,12 @@ def _extract_mailto_addresses(href: str) -> List[str]:
     """
     out: List[str] = []
     try:
-        # Normalize prefix and strip scheme
         h = href.strip()
         if not h.lower().startswith("mailto:"):
             return out
         rest = h.split(":", 1)[1]
         if rest.startswith("//"):
-            rest = rest.lstrip("/")  # handle 'mailto://user@...'
-        # Split address part and query
+            rest = rest.lstrip("/")
         addr_part, _, query = rest.partition("?")
         addr_part = _clean_angle_brackets(unquote(addr_part)).strip()
         if addr_part:
@@ -598,7 +848,6 @@ def _extract_mailto_addresses(href: str) -> List[str]:
                     out.extend(re.split(r"[;,]", unquote(item)))
     except Exception as exc:
         logger.debug("Failed to parse mailto %s: %s", href, exc)
-    # Clean up empties/whitespace
     return [a.strip() for a in out if a and a.strip()]
 
 
@@ -632,6 +881,9 @@ class Crawler:
         self.max_depth = max_depth
         self.concurrency = concurrency
         self.visited: Set[str] = set()
+        self._queued: Set[str] = set()
+        self._seen_keys: Set[Tuple[str, str, bool]
+                             ] = set()  # structural de-dup
         self.emails: Dict[str, str] = {}  # canonical -> canonical (lower-case)
         self.phones: Dict[str, str] = {}  # normalized digits
         self.email_sources: Dict[str, str] = {}
@@ -645,6 +897,8 @@ class Crawler:
         self._org = _ext.top_domain_under_public_suffix
         self._emails_kept = 0
         self._emails_dropped = 0
+        self._phones_kept = 0
+        self._phones_dropped = 0
         logger.debug(
             "Initializing internal crawler for https://%s (org=%s)",
             domain, self._org or "?"
@@ -675,7 +929,6 @@ class Crawler:
             )
             return
 
-        # kept: identical INFO logs as before
         is_new = canon not in self.emails
         if is_new:
             self.emails[canon] = canon
@@ -696,6 +949,7 @@ class Crawler:
             if is_new:
                 self.phones[norm] = norm
                 self.phone_sources[norm] = source
+                self._phones_kept += 1
                 logger.info("Found phone: %s (source: %s)", norm, source)
             else:
                 logger.debug(
@@ -703,29 +957,48 @@ class Crawler:
             if logger.isEnabledFor(logging.DEBUG) and snippet:
                 logger.debug("Phone snippet: %s",
                              " ".join(snippet.strip().split()))
+        else:
+            self._phones_dropped += 1
 
     async def crawl(self, start_url: str):
         """Breadth-first crawl starting from the supplied URL."""
         logger.debug("Starting the inner crawler at %s", start_url)
         queue = deque([(start_url, 0)])
+        self._queued.add(start_url)
         timeout = aiohttp.ClientTimeout(total=30)
         connector = aiohttp.TCPConnector(
-            limit=self.concurrency, family=socket.AF_INET, ttl_dns_cache=60)
+            limit=self.concurrency, family=socket.AF_INET, ttl_dns_cache=60
+        )
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             while queue:
                 tasks = []
                 while queue and len(tasks) < self.concurrency:
                     url, depth = queue.popleft()
-                    if depth > self.max_depth or url in self.visited:
+
+                    # Structural de-dup check and depth gate
+                    key = _url_struct_key(url)
+                    if depth > self.max_depth or key in self._seen_keys:
+                        continue
+                    self._seen_keys.add(key)
+
+                    if url in self.visited:
                         continue
                     self.visited.add(url)
+
                     tasks.append(self._process_url(session, url, depth, queue))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=False)
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
         logger.debug("Crawling %s (depth: %d)", url, depth)
-        content = await fetch_url(session, url)
+        try:
+            content = await asyncio.wait_for(fetch_url(session, url), timeout=40)
+        except asyncio.TimeoutError:
+            logger.debug("Timed out fetching %s", url)
+            return
+        except Exception as e:
+            logger.debug("Error fetching %s: %r", url, e)
+            return
         if not content:
             return
 
@@ -753,23 +1026,28 @@ class Crawler:
                     text_snip = a.get_text(" ", strip=True) or href
                     self.add_phone(num, url, text_snip)
 
-        # Follow in-scope links
+        # Follow in-scope links (HTML pages)
         for link in soup.find_all("a", href=True):
-            new_url = urljoin(url, link["href"])
-            parsed = urlparse(new_url)
-            if parsed.scheme.startswith("http") and parsed.netloc.endswith(self.domain):
-                if new_url not in self.visited and not should_skip_url_by_path(new_url):
-                    queue.append((new_url, depth + 1))
-                    logger.debug("Discovered link %s", new_url)
+            cand = canonicalize_url(url, link["href"], scope_host=self.domain)
+            if not cand or should_skip_url_by_path(cand):
+                continue
+            k = _url_struct_key(cand)
+            if k not in self._seen_keys and cand not in self._queued:
+                queue.append((cand, depth + 1))
+                self._queued.add(cand)
+                logger.debug("Discovered link %s", cand)
 
         # Crawl JS sources too
         for script in soup.find_all("script", src=True):
-            src = urljoin(url, script["src"])
-            parsed = urlparse(src)
-            if parsed.scheme.startswith("http") and parsed.netloc.endswith(self.domain):
-                if src not in self.visited and not should_skip_url_by_path(src):
-                    queue.append((src, depth + 1))
-                    logger.debug("Discovered script %s", src)
+            cand = canonicalize_url(url, script["src"], scope_host=self.domain)
+            if not cand or should_skip_url_by_path(cand):
+                continue
+            if cand.lower().endswith((".js", ".mjs")):
+                k = _url_struct_key(cand)
+                if k not in self._seen_keys and cand not in self._queued:
+                    queue.append((cand, depth + 1))
+                    self._queued.add(cand)
+                    logger.debug("Discovered script %s", cand)
 
     def extract_data(self, text: str, url: str, *, allow_phones: bool = True):
         before_emails = len(self.emails)
@@ -781,8 +1059,7 @@ class Crawler:
 
         if allow_phones:
             for m in PHONE_RE.finditer(text):
-                snippet = text[max(m.start()-20, 0)
-                                   : m.end()+20].replace("\n", " ")
+                snippet = text[max(m.start()-20, 0)                               : m.end()+20].replace("\n", " ")
                 self.add_phone(m.group(), url, snippet)
 
         new_emails = len(self.emails) - before_emails
@@ -921,9 +1198,30 @@ def save_results(
             }
         )
 
+    metrics = results.get("metrics", {})  # may be missing if monitor disabled
+
+    summary = {
+        "num_subdomains": len(results.get("subdomains", [])),
+        "num_endpoints": results.get("num_endpoints", 0),
+        "num_emails": len(results.get("emails", [])),
+        "num_phones": len(results.get("phones", [])),
+        "num_breached_emails": len(breached_emails),
+        "num_breached_phones": len(breached_phones),
+        "emails_dropped": results.get("emails_dropped", 0),
+        "phones_dropped": results.get("phones_dropped", 0),
+        # ---- NEW metrics in summary ----
+        "cpu_avg_percent": metrics.get("cpu_avg"),
+        "cpu_peak_percent": metrics.get("cpu_peak"),
+        "mem_avg_mb": metrics.get("mem_avg_mb"),
+        "mem_peak_mb": metrics.get("mem_peak_mb"),
+    }
+
     report = {
         "scan_domain": domain,
-        "scan_time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "scan_start": results.get("scan_start"),
+        "scan_end": results.get("scan_end"),
+        "scan_duration": results.get("scan_duration"),
+        "summary": summary,
         "subdomains": sorted(results.get("subdomains", [])),
         "emails": emails,
         "phones": phones,
@@ -943,6 +1241,13 @@ def save_results(
         import csv
         with open(output_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
+            writer.writerow(["scan_start", report.get("scan_start")])
+            writer.writerow(["scan_end", report.get("scan_end")])
+            writer.writerow(["scan_duration", report.get("scan_duration")])
+            writer.writerow([])
+            for key, value in summary.items():
+                writer.writerow([key, value])
+            writer.writerow([])
             writer.writerow(["type", "value", "source", "breaches"])
             for sub in report["subdomains"]:
                 writer.writerow(["subdomain", sub, "", ""])
@@ -954,6 +1259,14 @@ def save_results(
                     ["phone", item["phone"], item["source"], ", ".join(item["breaches"])])
     elif fmt == "md":
         lines = [f"# Scan Report for {domain}", ""]
+        lines.append(f"Start: {report.get('scan_start')}")
+        lines.append(f"End: {report.get('scan_end')}")
+        lines.append(f"Duration: {report.get('scan_duration')}")
+        lines.append("")
+        lines.append("## Summary")
+        for key, value in summary.items():
+            lines.append(f"- {key.replace('_', ' ')}: {value}")
+        lines.append("")
         lines.append("## Subdomains")
         for sub in report["subdomains"]:
             lines.append(f"- {sub}")
@@ -992,7 +1305,11 @@ async def scan_domain(
     concurrency: int = 5,
 ) -> dict:
     """Crawl a domain and optionally check contacts against breach data."""
+    # ---- start resource monitor ----
+    mon_stop, mon_thread, mon_samples = _start_resource_monitor()
+
     start_time = time.time()
+    start_dt = datetime.datetime.now(datetime.timezone.utc)
     logger.info("Starting scan for %s (depth: %d, concurrency: %d)",
                 domain, depth, concurrency)
 
@@ -1014,6 +1331,9 @@ async def scan_domain(
     logger.info("Using internal Python crawler.")
     crawler = Crawler(domain, max_depth=depth, concurrency=concurrency)
 
+    # ---- Start shared Playwright before crawling; shut it down after crawl/breaches ----
+    await _ensure_pw_started()
+
     stage += 1
     logger.info("Stage %d: Crawling %d URL(s) to find contacts...",
                 stage, len(subdomain_schemes))
@@ -1029,6 +1349,9 @@ async def scan_domain(
     logger.debug("Email filter (org) stats: kept=%d, dropped=%d",
                  getattr(crawler, "_emails_kept", 0),
                  getattr(crawler, "_emails_dropped", 0))
+    logger.debug("Phone filter stats: kept=%d, dropped=%d",
+                 getattr(crawler, "_phones_kept", 0),
+                 getattr(crawler, "_phones_dropped", 0))
 
     stage += 1
     breached_emails: Dict[str, List[str]] = {}
@@ -1048,6 +1371,12 @@ async def scan_domain(
         if breaches:
             breached_phones[phone] = breaches
 
+    # ---- stop shared Playwright after all work is done ----
+    await _shutdown_pw()
+
+    # ---- stop resource monitor & compute metrics ----
+    metrics = _stop_resource_monitor(mon_stop, mon_thread, mon_samples)
+
     results = {
         "subdomains": set(subdomain_schemes.keys()),
         "emails": set(crawler.emails.values()),
@@ -1056,11 +1385,20 @@ async def scan_domain(
         "breached_phones": breached_phones,
         "email_sources": crawler.email_sources,
         "phone_sources": crawler.phone_sources,
+        "num_endpoints": len(crawler.visited),
+        "emails_dropped": getattr(crawler, "_emails_dropped", 0),
+        "phones_dropped": getattr(crawler, "_phones_dropped", 0),
+        "metrics": metrics,  # <---- NEW
     }
 
+    end_dt = datetime.datetime.now(datetime.timezone.utc)
     duration = time.time() - start_time
     results["scan_duration"] = duration
+    ts_format = "%Y-%m-%d %H:%M:%S %Z"
+    results["scan_start"] = start_dt.strftime(ts_format)
+    results["scan_end"] = end_dt.strftime(ts_format)
     return results
+
 
 # ---------------------- CLI ----------------------
 
@@ -1127,16 +1465,22 @@ async def main() -> dict:
     logging.info("%s", "=" * 60)
     logging.info("Scan Complete for %s in %.2f seconds.",
                  domain_norm, results.get("scan_duration", 0.0))
+    logging.info("Scan started at %s and ended at %s",
+                 results.get("scan_start"), results.get("scan_end"))
     logging.info(
-        "Summary: Found %d subdomains, %d emails (%d breached), and %d phones (%d breached).",
+        "Summary: Crawled %d endpoints, %d subdomains, %d emails (%d breached, %d dropped) and %d phones (%d breached, %d dropped).",
+        results.get("num_endpoints", 0),
         len(results["subdomains"]),
         len(results["emails"]),
         len(results["breached_emails"]),
+        results.get("emails_dropped", 0),
         len(results["phones"]),
         len(results.get("breached_phones", {})),
+        results.get("phones_dropped", 0),
     )
     logging.info("%s", "=" * 60)
     return results
+
 
 if __name__ == "__main__":
     asyncio.run(main())

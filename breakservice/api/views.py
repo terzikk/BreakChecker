@@ -3,9 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from asgiref.sync import async_to_sync
 import os
-from break_checker import scan_domain, load_config, validate_domain
-
-import logging
+from break_checker import scan_domain, load_config, validate_domain, logger
 
 
 class ScanView(APIView):
@@ -28,12 +26,12 @@ class ScanView(APIView):
                 "HIBP_API_KEY") or cfg.get("hibp_api_key")
             leak_key = os.environ.get(
                 "LEAKCHECK_API_KEY") or cfg.get("leakcheck_api_key")
-            logging.info(
+            logger.info(
                 "SCAN: Starting scan for %s ", domain)
             results = async_to_sync(scan_domain)(
                 domain, depth, hibp_key, leak_key)
 
-            logging.info(
+            logger.info(
                 "SCAN: Scan completed with %d endpoints, %d subdomains, %d emails (%d breached, %d dropped), and %d phones (%d breached, %d dropped).",
                 results.get("num_endpoints", 0),
                 len(results["subdomains"]),
@@ -45,7 +43,7 @@ class ScanView(APIView):
                 results.get("phones_dropped", 0),
             )
         except Exception as e:
-            logging.exception("SCAN: Exception in scan_domain")
+            logger.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)
 
         payload = {

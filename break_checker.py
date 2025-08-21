@@ -59,21 +59,26 @@ import tldextract
 import threading
 import psutil
 
-
 # ---------------------- Logging ----------------------
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure root logging and return module logger with .log backups."""
+    """Configure and return module logger with file & console handlers.
+
+    Uses a dedicated logger so web servers like Gunicorn that configure the
+    root logger do not duplicate our messages. Subsequent calls simply adjust
+    the log level.
+    """
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
-    root_logger = logging.getLogger()
+    logger = logging.getLogger("break_checker")
 
     if getattr(configure_logging, "_configured", False):
-        root_logger.setLevel(level)
-        return logging.getLogger(__name__)
+        logger.setLevel(level)
+        return logger
 
-    if root_logger.hasHandlers():
-        root_logger.handlers.clear()
+    # Remove any pre-existing handlers to avoid duplicate log lines
+    if logger.hasHandlers():
+        logger.handlers.clear()
 
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
@@ -107,15 +112,16 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
 
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(stream_handler)
-    root_logger.setLevel(level)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    logger.setLevel(level)
+    logger.propagate = False  # prevent messages from being handled twice
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
 
     configure_logging._configured = True
-    return logging.getLogger(__name__)
+    return logger
 
 
 logger = configure_logging()
@@ -1462,12 +1468,12 @@ async def main() -> dict:
 
     save_results(results, domain_norm, fmt=fmt, output_path=args.output)
 
-    logging.info("%s", "=" * 60)
-    logging.info("Scan Complete for %s in %.2f seconds.",
-                 domain_norm, results.get("scan_duration", 0.0))
-    logging.info("Scan started at %s and ended at %s",
-                 results.get("scan_start"), results.get("scan_end"))
-    logging.info(
+    logger.info("%s", "=" * 60)
+    logger.info("Scan Complete for %s in %.2f seconds.",
+                domain_norm, results.get("scan_duration", 0.0))
+    logger.info("Scan started at %s and ended at %s",
+                results.get("scan_start"), results.get("scan_end"))
+    logger.info(
         "Summary: Crawled %d endpoints, %d subdomains, %d emails (%d breached, %d dropped) and %d phones (%d breached, %d dropped).",
         results.get("num_endpoints", 0),
         len(results["subdomains"]),
@@ -1478,7 +1484,7 @@ async def main() -> dict:
         len(results.get("breached_phones", {})),
         results.get("phones_dropped", 0),
     )
-    logging.info("%s", "=" * 60)
+    logger.info("%s", "=" * 60)
     return results
 
 

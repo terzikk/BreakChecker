@@ -48,10 +48,33 @@ class ScanView(APIView):
             logging.exception("SCAN: Exception in scan_domain")
             return Response({"error": str(e)}, status=500)
 
+        metrics = results.get("metrics", {})
+
+        emails = [
+            {
+                "address": email,
+                "source": results["email_sources"].get(email, ""),
+                "breaches": results["breached_emails"].get(email, [])
+            }
+            for email in results.get("emails", [])
+        ]
+        emails.sort(key=lambda x: x["address"])
+
+        phones = [
+            {
+                "number": phone,
+                "source": results["phone_sources"].get(phone, ""),
+                "breaches": results.get("breached_phones", {}).get(phone, [])
+            }
+            for phone in results.get("phones", [])
+        ]
+        phones.sort(key=lambda x: x["number"])
+
         payload = {
             "domain": domain,
             "scan_start": results.get("scan_start"),
             "scan_end": results.get("scan_end"),
+            "scan_duration": results.get("scan_duration"),
             "summary": {
                 "num_endpoints": results.get("num_endpoints", 0),
                 "num_subdomains": len(results["subdomains"]),
@@ -61,24 +84,14 @@ class ScanView(APIView):
                 "num_invalid_phones": results.get("phones_dropped", 0),
                 "num_breached_emails": len(results["breached_emails"]),
                 "num_breached_phones": len(results.get("breached_phones", {})),
+                "cpu_avg_percent": metrics.get("cpu_avg"),
+                "cpu_peak_percent": metrics.get("cpu_peak"),
+                "mem_avg_mb": metrics.get("mem_avg_mb"),
+                "mem_peak_mb": metrics.get("mem_peak_mb"),
             },
             "subdomains": sorted(results["subdomains"]),
-            "emails": [
-                {
-                    "address": email,
-                    "source": results["email_sources"].get(email, ""),
-                    "breaches": results["breached_emails"].get(email, [])
-                }
-                for email in sorted(results["emails"])
-            ],
-            "phones": [
-                {
-                    "number": phone,
-                    "source": results["phone_sources"].get(phone, ""),
-                    "breaches": results.get("breached_phones", {}).get(phone, [])
-                }
-                for phone in sorted(results["phones"])
-            ]
+            "emails": emails,
+            "phones": phones,
         }
 
         return Response(payload)

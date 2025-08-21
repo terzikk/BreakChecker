@@ -1178,25 +1178,25 @@ def save_results(
     breached_emails = results.get("breached_emails", {})
     breached_phones = results.get("breached_phones", {})
 
-    emails = []
-    for email in sorted(results.get("emails", set())):
-        emails.append(
-            {
-                "email": email,
-                "source": email_sources.get(email, ""),
-                "breaches": breached_emails.get(email, []),
-            }
-        )
+    emails = [
+        {
+            "email": email,
+            "source": email_sources.get(email, ""),
+            "breaches": breached_emails.get(email, []),
+        }
+        for email in results.get("emails", set())
+    ]
+    emails.sort(key=lambda x: x["email"])
 
-    phones = []
-    for phone in sorted(results.get("phones", set())):
-        phones.append(
-            {
-                "phone": phone,
-                "source": phone_sources.get(phone, ""),
-                "breaches": breached_phones.get(phone, []),
-            }
-        )
+    phones = [
+        {
+            "phone": phone,
+            "source": phone_sources.get(phone, ""),
+            "breaches": breached_phones.get(phone, []),
+        }
+        for phone in results.get("phones", set())
+    ]
+    phones.sort(key=lambda x: x["phone"])
 
     metrics = results.get("metrics", {})  # may be missing if monitor disabled
 

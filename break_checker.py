@@ -41,7 +41,7 @@ from urllib.parse import (
     urlunparse,
     urldefrag,
 )
-from collections import deque
+from collections import deque, defaultdict
 import datetime
 import phonenumbers
 import requests
@@ -235,6 +235,7 @@ def validate_domain(user_input: str, *, check_dns: bool = True) -> Tuple[bool, s
 
     return True, host_ascii, "Valid"
 
+
 # ---------------------- Subdomain enumeration ----------------------
 
 
@@ -259,7 +260,7 @@ def enumerate_subdomains(domain: str) -> Set[str]:
         # crt.sh
         try:
             url = f"https://crt.sh/json?q={domain}"
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=20)
             if resp.status_code == 200:
                 for entry in resp.json():
                     name_value = entry.get("name_value", "")
@@ -277,7 +278,7 @@ def enumerate_subdomains(domain: str) -> Set[str]:
         # HackerTarget
         try:
             url = f"https://api.hackertarget.com/hostsearch/?q={domain}"
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=20)
             if resp.status_code == 200:
                 for line in resp.text.splitlines():
                     if "," in line:
@@ -293,7 +294,7 @@ def enumerate_subdomains(domain: str) -> Set[str]:
         # Anubis-DB
         try:
             url = f"https://anubisdb.com/anubis/subdomains/{domain}"
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=20)
             if resp.status_code == 200:
                 for subdomain in resp.json():
                     subdomain = subdomain.strip().lower()
@@ -308,6 +309,7 @@ def enumerate_subdomains(domain: str) -> Set[str]:
     logger.info("Found %d subdomains for %s", len(subs), domain)
     return subs
 
+
 # ---------------------- Liveness probing (IPv4, retry, HEAD→GET) ----------------------
 
 
@@ -321,7 +323,7 @@ async def _probe_once(session: aiohttp.ClientSession, method: str, url: str) -> 
         return False
 
 
-async def choose_scheme(session: aiohttp.ClientSession, host: str, *, retries: int = 1, per_try_delay: float = 0.2) -> Optional[str]:
+async def choose_scheme(session: aiohttp.ClientSession, host: str, *, retries: int = 2, per_try_delay: float = 0.35) -> Optional[str]:
     """Return reachable scheme ('https' or 'http') using IPv4-only connector with retries."""
     for scheme in ("https", "http"):
         base = f"{scheme}://{host}"
@@ -335,13 +337,13 @@ async def choose_scheme(session: aiohttp.ClientSession, host: str, *, retries: i
     return None
 
 
-async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int = 5, retries: int = 1) -> Dict[str, str]:
+async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int = 5, retries: int = 2) -> Dict[str, str]:
     """Return mapping of reachable subdomains to their scheme using asynchronous probes."""
     live: Dict[str, str] = {}
-    timeout = aiohttp.ClientTimeout(total=6)
+    timeout = aiohttp.ClientTimeout(total=10)  # was 6
     connector = aiohttp.TCPConnector(
-        limit=concurrency, family=socket.AF_INET, ttl_dns_cache=60)
-    hosts = list(subdomains)
+        limit=concurrency, family=socket.AF_INET, ttl_dns_cache=120)
+    hosts = sorted(list(subdomains))  # stabilize order
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         tasks = [choose_scheme(session, host, retries=retries)
@@ -356,6 +358,7 @@ async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int
 
     logger.info("Accessible subdomains: %d of %d", len(live), len(subdomains))
     return live
+
 
 # ---------------------- Fetching (download-skip + Playwright fallback) ----------------------
 
@@ -393,25 +396,34 @@ def is_probably_html(content_type: str) -> bool:
     return ct in ("text/html", "application/xhtml+xml")
 
 
-async def get_stable_content(page, *, total_ms: int = 10000) -> Optional[str]:
+async def get_stable_content(page, *, total_ms: int = 18000) -> Optional[str]:
     deadline = time.monotonic() + total_ms / 1000.0
+    tried_idle = False
     while time.monotonic() < deadline:
         try:
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=1500)
+                await page.wait_for_load_state("domcontentloaded", timeout=2000)
             except PWError:
                 pass
-            url_before = page.url
-            html = await page.content()
-            await page.wait_for_timeout(200)
-            if page.url == url_before:
+            try:
+                html = await page.content()
+            except PWError:
+                html = None
+            await page.wait_for_timeout(250)
+            if html:
                 return html
+            if not tried_idle:
+                tried_idle = True
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=1500)
+                except PWError:
+                    pass
         except PWError:
             await page.wait_for_timeout(250)
     return None
 
 
-async def http_fallback(context, url: str, timeout: int = 45000) -> Optional[str]:
+async def http_fallback(context, url: str, timeout: int = 60000) -> Optional[str]:
     try:
         r = await context.request.get(url, timeout=timeout)
         if r.ok:
@@ -420,7 +432,9 @@ async def http_fallback(context, url: str, timeout: int = 45000) -> Optional[str
         pass
     return None
 
+
 _DEAD_HOSTS: set[str] = set()
+_DEAD_HOST_FAILS: Dict[str, int] = defaultdict(int)
 
 
 def _classify_net_error(exc: Exception) -> str:
@@ -450,7 +464,7 @@ def _classify_net_error(exc: Exception) -> str:
     return "other"
 
 
-# ---------- Persistent Playwright (single browser/context, NO CAP) ----------
+# ---------- Persistent Playwright (single global context) ----------
 
 _PW = None
 _PW_BROWSER = None
@@ -458,18 +472,19 @@ _PW_CTX = None
 
 
 async def _ensure_pw_started():
-    """Start Playwright once and create a shared context (no page cap)."""
+    """Start Playwright once and create a shared global context."""
     global _PW, _PW_BROWSER, _PW_CTX
     if _PW is not None:
         return
-
     _PW = await async_playwright().start()
     _PW_BROWSER = await _PW.chromium.launch(headless=True)
     _PW_CTX = await _PW_BROWSER.new_context(
         ignore_https_errors=True,
-        bypass_csp=True
+        bypass_csp=True,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36",
+        locale="en-US",
+        timezone_id="UTC",
     )
-
     # Block heavy assets globally to keep renders fast and quiet
     await _PW_CTX.route("**/*", lambda route: (
         route.abort() if route.request.resource_type in {"image", "media", "font"}
@@ -502,8 +517,8 @@ async def _shutdown_pw():
 
 async def _render_with_pw(url: str) -> Optional[str]:
     """
-    Render a URL using the shared Playwright browser/context (no cap).
-    Includes a single self-heal retry if the context/browser died under load.
+    Render a URL using the shared Playwright browser/context.
+    Includes a single self-heal retry if the browser died under load.
     """
     await _ensure_pw_started()
     assert _PW_CTX is not None
@@ -512,8 +527,7 @@ async def _render_with_pw(url: str) -> Optional[str]:
         page = await _PW_CTX.new_page()
         try:
             try:
-                # Faster nav; salvage on failures
-                await page.goto(url, timeout=15000, wait_until="commit")
+                await page.goto(url, timeout=25000, wait_until="commit")
             except PWError as exc:
                 # salvage whatever we can
                 try:
@@ -529,7 +543,7 @@ async def _render_with_pw(url: str) -> Optional[str]:
                              _classify_net_error(exc), url)
                 return None
 
-            html = await get_stable_content(page, total_ms=8000)
+            html = await get_stable_content(page, total_ms=18000)
             if html:
                 return html
 
@@ -547,16 +561,15 @@ async def _render_with_pw(url: str) -> Optional[str]:
             except Exception:
                 pass
 
-    # Try once
+    # Try once, then try restart on browser death
     try:
         html = await _once()
         if html is not None:
             return html
     except PWError as exc:
-        # If the context is gone, restart once
         msg = str(exc).lower()
         if "closed" in msg or "target closed" in msg or "browser has been closed" in msg:
-            logger.debug("Playwright context died; restarting...")
+            logger.debug("Playwright browser died; restarting...")
             await _shutdown_pw()
             await _ensure_pw_started()
             try:
@@ -571,8 +584,8 @@ async def _render_with_pw(url: str) -> Optional[str]:
 
 
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Fetch a URL; only render with Playwright for likely-HTML that responds.
-    All failures/skips are logged at DEBUG so they don't clutter stdout."""
+    """Fetch a URL with resilient content-type handling and GET-after-bad-HEAD.
+    Playwright render only for likely HTML."""
     try:
         if should_skip_url_by_path(url):
             logger.debug("Skipping by path/extension: %s", url)
@@ -584,32 +597,57 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
             logger.debug("Skipping %s (host marked dead)", url)
             return None
 
-        # HEAD preflight (tighter timeout)
-        content_type = None
-        content_disp = None
+        # Try HEAD, but never bail only because HEAD failed or was >=400
+        head_status = None
+        content_type = ""
+        content_disp = ""
         try:
-            async with session.head(url, allow_redirects=True, timeout=8) as resp:
-                content_type = resp.headers.get("Content-Type", "")
-                content_disp = resp.headers.get("Content-Disposition", "")
-                if resp.status >= 400:
-                    logger.debug("Skip: %s returned %s on HEAD",
-                                 url, resp.status)
-                    return None
+            async with session.head(url, allow_redirects=True, timeout=12) as resp:
+                head_status = resp.status
+                content_type = resp.headers.get("Content-Type", "") or ""
+                content_disp = resp.headers.get(
+                    "Content-Disposition", "") or ""
         except Exception as exc:
-            reason = _classify_net_error(exc)
-            logger.debug("Skip: %s on HEAD %s", reason, url)
-            if reason == "refused" and host:
-                _DEAD_HOSTS.add(host)
-            return None
+            logger.debug("HEAD error (%s) at %s",
+                         _classify_net_error(exc), url)
 
         if content_disp and "attachment" in content_disp.lower():
             logger.debug("Skipping by Content-Disposition attachment: %s", url)
             return None
 
+        # If HEAD is bad/inconclusive or missing type, do one GET
+        if head_status is None or head_status >= 400 or not content_type:
+            try:
+                async with session.get(url, allow_redirects=True, timeout=20) as resp:
+                    if resp.status >= 400:
+                        logger.debug("Skip: GET %s returned %s",
+                                     url, resp.status)
+                        return None
+                    sniff = resp.headers.get("Content-Type", "") or ""
+                    if sniff:
+                        content_type = sniff
+                    text = await resp.text(errors="replace")
+                    # If server lies about type, still try HTML heuristics
+                    if is_probably_html(content_type) or "<html" in text.lower():
+                        return text
+                    if content_type.lower().startswith("text/") or content_type.lower().startswith("application/javascript"):
+                        return text
+                    return None
+            except Exception as exc:
+                reason = _classify_net_error(exc)
+                logger.debug(
+                    "GET failed after bad/no HEAD (%s) %s", reason, url)
+                if reason == "refused" and host:
+                    _DEAD_HOST_FAILS[host] += 1
+                    if _DEAD_HOST_FAILS[host] >= 2:
+                        _DEAD_HOSTS.add(host)
+                return None
+
+        # If HEAD says non-HTML but it's text, do GET for text asset
         if content_type and not is_probably_html(content_type):
             if content_type.lower().startswith("text/") or content_type.lower().startswith("application/javascript"):
                 try:
-                    async with session.get(url, allow_redirects=True, timeout=12) as resp:
+                    async with session.get(url, allow_redirects=True, timeout=20) as resp:
                         if resp.status < 400:
                             return await resp.text(errors="replace")
                         logger.debug("Skip: GET %s returned %s",
@@ -619,31 +657,15 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
                     logger.debug("GET failed for text asset %s: %s", url, exc)
             return None
 
-        if not content_type:
-            try:
-                async with session.get(url, allow_redirects=True, timeout=12) as resp:
-                    if resp.status >= 400:
-                        logger.debug("Skip: %s returned %s on GET",
-                                     url, resp.status)
-                        return None
-                    sniff = resp.headers.get("Content-Type", "")
-                    if sniff and not is_probably_html(sniff):
-                        if sniff.lower().startswith("text/") or sniff.lower().startswith("application/javascript"):
-                            return await resp.text(errors="replace")
-                        return None
-            except Exception as exc:
-                reason = _classify_net_error(exc)
-                logger.debug("Skip: %s on GET %s", reason, url)
-                if reason == "refused" and host:
-                    _DEAD_HOSTS.add(host)
-                return None
-
-        # Playwright only for cooperative HTML (shared browser/context)
+        # At this point we think it's HTML. Render with Playwright for DOM-complete text.
         logger.debug("Rendering (HTML): %s", url)
-        return await _render_with_pw(url)
+        html = await _render_with_pw(url)
+        if html is None:
+            await asyncio.sleep(0.35)
+            html = await _render_with_pw(url)
+        return html
 
     except Exception as e:
-        # Unexpected exceptions only — still keep them at DEBUG per your preference
         reason = _classify_net_error(e)
         logger.debug("Fetch error (%s) at %s: %s", reason, url, e)
         return None
@@ -734,20 +756,19 @@ def canonicalize_url(base_url: str, link: str, *, scope_host: str) -> Optional[s
     return urlunparse((parsed.scheme, netloc, path, "", query, ""))
 
 
-def _url_struct_key(u: str) -> Tuple[str, str, bool]:
+def _url_struct_key(u: str) -> Tuple[str, str, Tuple[Tuple[str, str], ...]]:
     """
     Return a canonical structural key for dedup:
-      (host, normalized_path_without_html_or_trailing_slash, has_query)
-    so /a/b, /a/b/, and /a/b.html collapse to the same key.
+      (host, normalized_path_without_html_or_trailing_slash, first N sorted query pairs)
+    so /a/b, /a/b/, and /a/b.html collapse, but distinct query variants don't.
     """
     p = urlparse(u)
     host = (p.hostname or "").lower()
     path = (p.path or "/").rstrip("/")
     if path.endswith(".html"):
-        path = path[:-5]
-        if not path:
-            path = "/"
-    return (host, path, bool(p.query))
+        path = path[:-5] or "/"
+    q_pairs = tuple(sorted(parse_qsl(p.query, keep_blank_values=False)))[:5]
+    return (host, path, q_pairs)
 
 
 # ---------------------- Extraction helpers ----------------------
@@ -801,6 +822,7 @@ def normalize_email(email: str) -> Optional[str]:
 def normalize_phone(phone: str, default_region: Optional[str] = None) -> Optional[str]:
     """
     Return phone in national digits-only if valid (>=7 digits). Tries E.164 and region fallback.
+    (Stricter original logic to reduce false positives.)
     """
     raw = phone.strip()
     try_order: List[Optional[str]] = [default_region,
@@ -870,6 +892,7 @@ def _extract_tel_numbers(href: str) -> List[str]:
         logger.debug("Failed to parse tel %s: %s", href, exc)
     return out
 
+
 # ---------------------- Crawler ----------------------
 
 
@@ -882,8 +905,9 @@ class Crawler:
         self.concurrency = concurrency
         self.visited: Set[str] = set()
         self._queued: Set[str] = set()
-        self._seen_keys: Set[Tuple[str, str, bool]
-                             ] = set()  # structural de-dup
+        # structural de-dup
+        self._seen_keys: Set[Tuple[str, str,
+                                   Tuple[Tuple[str, str], ...]]] = set()
         self.emails: Dict[str, str] = {}  # canonical -> canonical (lower-case)
         self.phones: Dict[str, str] = {}  # normalized digits
         self.email_sources: Dict[str, str] = {}
@@ -965,9 +989,9 @@ class Crawler:
         logger.debug("Starting the inner crawler at %s", start_url)
         queue = deque([(start_url, 0)])
         self._queued.add(start_url)
-        timeout = aiohttp.ClientTimeout(total=30)
+        timeout = aiohttp.ClientTimeout(total=45)  # was 30
         connector = aiohttp.TCPConnector(
-            limit=self.concurrency, family=socket.AF_INET, ttl_dns_cache=60
+            limit=self.concurrency, family=socket.AF_INET, ttl_dns_cache=120
         )
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             while queue:
@@ -992,7 +1016,7 @@ class Crawler:
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
         logger.debug("Crawling %s (depth: %d)", url, depth)
         try:
-            content = await asyncio.wait_for(fetch_url(session, url), timeout=40)
+            content = await asyncio.wait_for(fetch_url(session, url), timeout=70)
         except asyncio.TimeoutError:
             logger.debug("Timed out fetching %s", url)
             return
@@ -1026,28 +1050,31 @@ class Crawler:
                     text_snip = a.get_text(" ", strip=True) or href
                     self.add_phone(num, url, text_snip)
 
-        # Follow in-scope links (HTML pages)
+        # Follow in-scope links (HTML pages) with deterministic ordering
+        links = []
         for link in soup.find_all("a", href=True):
             cand = canonicalize_url(url, link["href"], scope_host=self.domain)
-            if not cand or should_skip_url_by_path(cand):
-                continue
+            if cand and not should_skip_url_by_path(cand):
+                links.append(cand)
+        for cand in sorted(set(links)):
             k = _url_struct_key(cand)
             if k not in self._seen_keys and cand not in self._queued:
                 queue.append((cand, depth + 1))
                 self._queued.add(cand)
                 logger.debug("Discovered link %s", cand)
 
-        # Crawl JS sources too
+        # Crawl JS sources too, deterministic ordering
+        scripts = []
         for script in soup.find_all("script", src=True):
             cand = canonicalize_url(url, script["src"], scope_host=self.domain)
-            if not cand or should_skip_url_by_path(cand):
-                continue
-            if cand.lower().endswith((".js", ".mjs")):
-                k = _url_struct_key(cand)
-                if k not in self._seen_keys and cand not in self._queued:
-                    queue.append((cand, depth + 1))
-                    self._queued.add(cand)
-                    logger.debug("Discovered script %s", cand)
+            if cand and not should_skip_url_by_path(cand) and cand.lower().endswith((".js", ".mjs")):
+                scripts.append(cand)
+        for cand in sorted(set(scripts)):
+            k = _url_struct_key(cand)
+            if k not in self._seen_keys and cand not in self._queued:
+                queue.append((cand, depth + 1))
+                self._queued.add(cand)
+                logger.debug("Discovered script %s", cand)
 
     def extract_data(self, text: str, url: str, *, allow_phones: bool = True):
         before_emails = len(self.emails)
@@ -1059,7 +1086,8 @@ class Crawler:
 
         if allow_phones:
             for m in PHONE_RE.finditer(text):
-                snippet = text[max(m.start()-20, 0)                               : m.end()+20].replace("\n", " ")
+                snippet = text[max(m.start()-20, 0)
+                                   : m.end()+20].replace("\n", " ")
                 self.add_phone(m.group(), url, snippet)
 
         new_emails = len(self.emails) - before_emails
@@ -1069,6 +1097,7 @@ class Crawler:
                 "Extracted %d valid email(s) and %d valid phone(s) from %s",
                 new_emails, new_phones, url
             )
+
 
 # ---------------------- Breach checkers ----------------------
 
@@ -1082,7 +1111,7 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     headers = {"Accept": "application/json",
                "Authorization": f"Api-Key {api_key}"}
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=12)
         if resp.status_code == 200:
             breaches = [b.get("Name") for b in resp.json()]
             if breaches:
@@ -1130,7 +1159,7 @@ def check_leakcheck_phone(phone: str, api_key: Optional[str]) -> Optional[List[s
     headers = {"Accept": "application/json", "X-API-Key": api_key}
     params = {"type": "phone"}
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        resp = requests.get(url, headers=headers, params=params, timeout=12)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, dict) and data.get("success") is True:
@@ -1161,6 +1190,7 @@ def check_leakcheck_phone(phone: str, api_key: Optional[str]) -> Optional[List[s
         logger.warning("LeakCheck lookup failed for %s: %s", phone, exc)
     return None
 
+
 # ---------------------- Results & reporting ----------------------
 
 
@@ -1178,25 +1208,25 @@ def save_results(
     breached_emails = results.get("breached_emails", {})
     breached_phones = results.get("breached_phones", {})
 
-    emails = []
-    for email in sorted(results.get("emails", set())):
-        emails.append(
-            {
-                "email": email,
-                "source": email_sources.get(email, ""),
-                "breaches": breached_emails.get(email, []),
-            }
-        )
+    emails = [
+        {
+            "email": email,
+            "source": email_sources.get(email, ""),
+            "breaches": breached_emails.get(email, []),
+        }
+        for email in results.get("emails", set())
+    ]
+    emails.sort(key=lambda x: x["email"])
 
-    phones = []
-    for phone in sorted(results.get("phones", set())):
-        phones.append(
-            {
-                "phone": phone,
-                "source": phone_sources.get(phone, ""),
-                "breaches": breached_phones.get(phone, []),
-            }
-        )
+    phones = [
+        {
+            "phone": phone,
+            "source": phone_sources.get(phone, ""),
+            "breaches": breached_phones.get(phone, []),
+        }
+        for phone in results.get("phones", set())
+    ]
+    phones.sort(key=lambda x: x["phone"])
 
     metrics = results.get("metrics", {})  # may be missing if monitor disabled
 
@@ -1209,7 +1239,6 @@ def save_results(
         "num_breached_phones": len(breached_phones),
         "emails_dropped": results.get("emails_dropped", 0),
         "phones_dropped": results.get("phones_dropped", 0),
-        # ---- NEW metrics in summary ----
         "cpu_avg_percent": metrics.get("cpu_avg"),
         "cpu_peak_percent": metrics.get("cpu_peak"),
         "mem_avg_mb": metrics.get("mem_avg_mb"),
@@ -1292,6 +1321,7 @@ def save_results(
     logger.debug("Results successfully saved to %s", output_path)
     return output_path
 
+
 # ---------------------- High level scan ----------------------
 
 
@@ -1320,7 +1350,7 @@ async def scan_domain(
     stage += 1
     logger.info(
         "Stage %d: Filtering %d subdomains for web accessibility...", stage, len(subs))
-    subdomain_schemes = await filter_accessible_subdomains(subs, concurrency=concurrency, retries=1)
+    subdomain_schemes = await filter_accessible_subdomains(subs, concurrency=concurrency, retries=2)
     logger.info("Found %d accessible web hosts.", len(subdomain_schemes))
     if verbose:
         logger.debug("%d of %d subdomains are accessible",
@@ -1331,13 +1361,13 @@ async def scan_domain(
     logger.info("Using internal Python crawler.")
     crawler = Crawler(domain, max_depth=depth, concurrency=concurrency)
 
-    # ---- Start shared Playwright before crawling; shut it down after crawl/breaches ----
+    # ---- Start Playwright (single global context); shut it down after crawl/breaches ----
     await _ensure_pw_started()
 
     stage += 1
     logger.info("Stage %d: Crawling %d URL(s) to find contacts...",
                 stage, len(subdomain_schemes))
-    for sub, scheme in subdomain_schemes.items():
+    for sub, scheme in sorted(subdomain_schemes.items()):  # stabilize order
         start_url = f"{scheme}://{sub}"
         if verbose:
             logger.debug("Crawling %s", start_url)
@@ -1371,7 +1401,7 @@ async def scan_domain(
         if breaches:
             breached_phones[phone] = breaches
 
-    # ---- stop shared Playwright after all work is done ----
+    # ---- stop Playwright after all work is done ----
     await _shutdown_pw()
 
     # ---- stop resource monitor & compute metrics ----
@@ -1388,7 +1418,7 @@ async def scan_domain(
         "num_endpoints": len(crawler.visited),
         "emails_dropped": getattr(crawler, "_emails_dropped", 0),
         "phones_dropped": getattr(crawler, "_phones_dropped", 0),
-        "metrics": metrics,  # <---- NEW
+        "metrics": metrics,
     }
 
     end_dt = datetime.datetime.now(datetime.timezone.utc)

@@ -58,6 +58,8 @@ import ssl
 import tldextract
 import threading
 import psutil
+import html
+import unicodedata
 
 
 # ---------------------- Logging ----------------------
@@ -396,31 +398,75 @@ def is_probably_html(content_type: str) -> bool:
     return ct in ("text/html", "application/xhtml+xml")
 
 
-async def get_stable_content(page, *, total_ms: int = 18000) -> Optional[str]:
+async def get_stable_content(
+    page,
+    *,
+    total_ms: int = 18000,
+    idle_ms: int = 1500,
+    hydrate_ms: int = 250,
+    min_text_len: int = 80,   # heuristic: don't accept skeleton DOMs
+) -> str | None:
+    """
+    Return 'good enough' HTML:
+      1) Try immediately after DOMContentLoaded → early exit if it looks real.
+      2) Brief hydration wait (React/Vue) → try again.
+      3) One-time network-idle wait (SPA data fetch) → try again.
+    All within a hard deadline. Returns None if the page never stabilizes.
+    """
     deadline = time.monotonic() + total_ms / 1000.0
-    tried_idle = False
+
+    async def read_html() -> str | None:
+        try:
+            return await page.content()
+        except PWError:
+            return None
+
+    async def text_len() -> int:
+        try:
+            return await page.evaluate(
+                "document.body && document.body.innerText ? document.body.innerText.length : 0"
+            )
+        except PWError:
+            return 0
+
     while time.monotonic() < deadline:
         try:
+            # 1) Reach a minimally useful state fast
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=2000)
+                await page.wait_for_load_state("domcontentloaded", timeout=min(2000, int((deadline - time.monotonic())*1000)))
             except PWError:
                 pass
-            try:
-                html = await page.content()
-            except PWError:
-                html = None
-            await page.wait_for_timeout(250)
-            if html:
+
+            # Early exit: static pages shouldn't pay a hydration tax
+            html = await read_html()
+            if html and await text_len() >= min_text_len:
                 return html
-            if not tried_idle:
-                tried_idle = True
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=1500)
-                except PWError:
-                    pass
+
+            # 2) Tiny hydration window for client-side frameworks
+            await page.wait_for_timeout(min(hydrate_ms, max(0, int((deadline - time.monotonic())*1000))))
+            html = await read_html()
+            if html and await text_len() >= min_text_len:
+                return html
+
+            # 3) One-time SPA fetch/render window (don't loop on networkidle)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(idle_ms, int((deadline - time.monotonic())*1000)))
+            except PWError:
+                pass
+            html = await read_html()
+            if html and await text_len() >= min_text_len:
+                return html
+
+            # If we’re here, we didn’t get meaningful content; brief pause and loop within budget
+            await page.wait_for_timeout(min(200, max(0, int((deadline - time.monotonic())*1000))))
+
         except PWError:
-            await page.wait_for_timeout(250)
+            # Random flake; short nap and try again until the deadline
+            await page.wait_for_timeout(min(200, max(0, int((deadline - time.monotonic())*1000))))
+
     return None
+
+
 
 
 async def http_fallback(context, url: str, timeout: int = 60000) -> Optional[str]:
@@ -531,25 +577,25 @@ async def _render_with_pw(url: str) -> Optional[str]:
             except PWError as exc:
                 # salvage whatever we can
                 try:
-                    html = await page.content()
-                    if html:
-                        return html
+                    html_text = await page.content()
+                    if html_text:
+                        return html_text
                 except Exception:
                     pass
-                html = await http_fallback(_PW_CTX, url)
-                if html:
-                    return html
+                html_text = await http_fallback(_PW_CTX, url)
+                if html_text:
+                    return html_text
                 logger.debug("Browser nav issue (%s) at %s",
                              _classify_net_error(exc), url)
                 return None
 
-            html = await get_stable_content(page, total_ms=18000)
-            if html:
-                return html
+            html_text = await get_stable_content(page, total_ms=18000)
+            if html_text:
+                return html_text
 
-            html = await http_fallback(_PW_CTX, page.url)
-            if html:
-                return html
+            html_text = await http_fallback(_PW_CTX, page.url)
+            if html_text:
+                return html_text
 
             try:
                 return await page.content()
@@ -563,9 +609,9 @@ async def _render_with_pw(url: str) -> Optional[str]:
 
     # Try once, then try restart on browser death
     try:
-        html = await _once()
-        if html is not None:
-            return html
+        html_text = await _once()
+        if html_text is not None:
+            return html_text
     except PWError as exc:
         msg = str(exc).lower()
         if "closed" in msg or "target closed" in msg or "browser has been closed" in msg:
@@ -584,9 +630,16 @@ async def _render_with_pw(url: str) -> Optional[str]:
 
 
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """Fetch a URL with resilient content-type handling and GET-after-bad-HEAD.
-    Playwright render only for likely HTML."""
+    """
+    Policy:
+      - If it's clearly a download → skip.
+      - If it's clearly text but NOT HTML → fetch with aiohttp and return text.
+      - If it's (likely) HTML → ALWAYS render with Playwright.
+      - If HEAD lies or is missing → do ONE GET to sniff headers/body,
+        but DO NOT return HTML from aiohttp; escalate to Playwright instead.
+    """
     try:
+        # 0) Cheap path/extension skip
         if should_skip_url_by_path(url):
             logger.debug("Skipping by path/extension: %s", url)
             return None
@@ -597,78 +650,77 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
             logger.debug("Skipping %s (host marked dead)", url)
             return None
 
-        # Try HEAD, but never bail only because HEAD failed or was >=400
+        # 1) Advisory HEAD
         head_status = None
         content_type = ""
         content_disp = ""
         try:
             async with session.head(url, allow_redirects=True, timeout=12) as resp:
                 head_status = resp.status
-                content_type = resp.headers.get("Content-Type", "") or ""
-                content_disp = resp.headers.get(
-                    "Content-Disposition", "") or ""
+                content_type = (resp.headers.get("Content-Type") or "").strip()
+                content_disp = (resp.headers.get("Content-Disposition") or "").strip()
         except Exception as exc:
-            logger.debug("HEAD error (%s) at %s",
-                         _classify_net_error(exc), url)
+            logger.debug("HEAD error (%s) at %s", _classify_net_error(exc), url)
 
+        # Attachments are not HTML pages; skip
         if content_disp and "attachment" in content_disp.lower():
             logger.debug("Skipping by Content-Disposition attachment: %s", url)
             return None
 
-        # If HEAD is bad/inconclusive or missing type, do one GET
+        # 2) If HEAD was bad/inconclusive → one GET to sniff
+        sniff_text = None
         if head_status is None or head_status >= 400 or not content_type:
             try:
                 async with session.get(url, allow_redirects=True, timeout=20) as resp:
                     if resp.status >= 400:
-                        logger.debug("Skip: GET %s returned %s",
-                                     url, resp.status)
+                        logger.debug("Skip: GET %s returned %s", url, resp.status)
                         return None
-                    sniff = resp.headers.get("Content-Type", "") or ""
-                    if sniff:
-                        content_type = sniff
-                    text = await resp.text(errors="replace")
-                    # If server lies about type, still try HTML heuristics
-                    if is_probably_html(content_type) or "<html" in text.lower():
-                        return text
-                    if content_type.lower().startswith("text/") or content_type.lower().startswith("application/javascript"):
-                        return text
-                    return None
+                    # Prefer GET's Content-Type when present
+                    sniff_ct = (resp.headers.get("Content-Type") or "").strip()
+                    if sniff_ct:
+                        content_type = sniff_ct
+                    sniff_text = await resp.text(errors="replace")
             except Exception as exc:
                 reason = _classify_net_error(exc)
-                logger.debug(
-                    "GET failed after bad/no HEAD (%s) %s", reason, url)
+                logger.debug("GET failed after bad/no HEAD (%s) %s", reason, url)
                 if reason == "refused" and host:
                     _DEAD_HOST_FAILS[host] += 1
                     if _DEAD_HOST_FAILS[host] >= 2:
                         _DEAD_HOSTS.add(host)
                 return None
 
-        # If HEAD says non-HTML but it's text, do GET for text asset
+        # 3) Non-HTML text assets: return them (no browser)
         if content_type and not is_probably_html(content_type):
+            # Treat text/* and application/javascript as "textual but not HTML"
             if content_type.lower().startswith("text/") or content_type.lower().startswith("application/javascript"):
+                if sniff_text is not None:
+                    return sniff_text
+                # If we didn't GET yet, do a single GET now to return the text
                 try:
                     async with session.get(url, allow_redirects=True, timeout=20) as resp:
                         if resp.status < 400:
                             return await resp.text(errors="replace")
-                        logger.debug("Skip: GET %s returned %s",
-                                     url, resp.status)
+                        logger.debug("Skip: GET %s returned %s", url, resp.status)
                         return None
                 except Exception as exc:
                     logger.debug("GET failed for text asset %s: %s", url, exc)
+            # Non-text, non-HTML (binary): skip
             return None
 
-        # At this point we think it's HTML. Render with Playwright for DOM-complete text.
+        # 4) HTML (or unknown that smells like HTML): ALWAYS render with Playwright
+        # If we sniffed a body, and it contains <html>, we STILL render (by policy).
         logger.debug("Rendering (HTML): %s", url)
-        html = await _render_with_pw(url)
-        if html is None:
+        html_text = await _render_with_pw(url)
+        if html_text is None:
             await asyncio.sleep(0.35)
-            html = await _render_with_pw(url)
-        return html
+            html_text = await _render_with_pw(url)
+        return html_text
 
     except Exception as e:
         reason = _classify_net_error(e)
         logger.debug("Fetch error (%s) at %s: %s", reason, url, e)
         return None
+
 
 
 # ---------------------- URL canonicalization helpers ----------------------
@@ -806,13 +858,53 @@ def _clean_angle_brackets(s: str) -> str:
         return s[1:-1]
     return s
 
+# ---- New: targeted text/email normalization helpers ----
+
+def _decode_backslash_escapes(s: str) -> str:
+    """
+    Decode only \\uXXXX and \\xNN sequences (like \\u003c, \\x3c) commonly found
+    in JSON/script blobs. Leaves other escapes (\\n, \\t, \\\\) untouched.
+    """
+    s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r"\\x([0-9a-fA-F]{2})",  lambda m: chr(int(m.group(1), 16)), s)
+    return s
+
+
+_PUNCT_EDGES = re.compile(r"^\s*([<\[\(\{\"']*)(.*?)([>\]\)\}\"']*)\s*$")
+
+
+def _strip_edge_punct(s: str) -> str:
+    """
+    Strip wrapper punctuation like <...>, "..." from the ends only.
+    """
+    m = _PUNCT_EDGES.match(s)
+    if not m:
+        return s.strip()
+    core = m.group(2).strip()
+    return core
+
+
+def _norm_text(s: str) -> str:
+    """
+    Normalize page text safely:
+      1) Unescape HTML entities (&lt; &#x3c; etc.)
+      2) Decode explicit \\uXXXX/\\xNN sequences
+      3) Normalize Unicode and drop zero-width/control chars (keep whitespace)
+    """
+    s = html.unescape(s)
+    s = _decode_backslash_escapes(s)
+    s = unicodedata.normalize("NFKC", s)
+    return "".join(
+        ch for ch in s
+        if (unicodedata.category(ch)[0] != "C") or ch in "\n\r\t"
+    )
+
 
 def normalize_email(email: str) -> Optional[str]:
     """Validate and normalize an email; canonical form is lower-case for dedup."""
-    cleaned = _clean_angle_brackets(
-        unquote(email.strip().strip("'").strip('"')))
+    candidate = _strip_edge_punct(_norm_text(unquote(email.strip())))
     try:
-        valid = validate_email(cleaned.lower(), check_deliverability=True)
+        valid = validate_email(candidate.lower(), check_deliverability=True)
         return valid.normalized.lower()
     except EmailNotValidError as exc:
         logger.debug("Email validation failed for %s: %s", email, exc)
@@ -1080,14 +1172,16 @@ class Crawler:
         before_emails = len(self.emails)
         before_phones = len(self.phones)
 
+        # Safe, targeted normalization (no unicode_escape sledgehammer)
+        text = _norm_text(text)
+
         for m in EMAIL_RE.finditer(text):
             snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
             self.add_email(m.group(), url, snippet)
 
         if allow_phones:
             for m in PHONE_RE.finditer(text):
-                snippet = text[max(m.start()-20, 0)
-                                   : m.end()+20].replace("\n", " ")
+                snippet = text[max(m.start()-20, 0): m.end()+20].replace("\n", " ")
                 self.add_phone(m.group(), url, snippet)
 
         new_emails = len(self.emails) - before_emails
@@ -1265,7 +1359,7 @@ def save_results(
     logger.info("Saving results to %s...", output_path)
     if fmt == "json":
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2, ensure_ascii=False)
     elif fmt == "csv":
         import csv
         with open(output_path, "w", newline="", encoding="utf-8") as f:

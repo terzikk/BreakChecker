@@ -1,25 +1,44 @@
-"""Domain crawler, subdomain enumerator and breach checker.
+﻿"""BreakChecker: domain crawler, contact extractor and breach checker.
 
-Usage:
-  python3 break_checker.py [options] domain
+Overview
+--------
+BreakChecker scans a target domain in well-defined stages to discover
+subdomains, crawl accessible web pages, extract emails and phone numbers,
+and then check these contacts against breach sources (HIBP and LeakCheck).
 
-The script now accepts command line arguments. API credentials and crawl depth
-are loaded from `config.json` if present, falling back to environment variables:
+Execution Stages
+----------------
+1) Subdomain Enumeration: Uses ``subfinder`` when available, with fallbacks
+   to crt.sh, HackerTarget, and Anubis DB.
+2) Accessibility Probe: Asynchronously tests each host for HTTP/HTTPS reachability.
+3) Crawl & Render: A focused, in-domain crawler renders pages with Playwright,
+   following page links and script sources up to a configurable depth.
+4) Extraction & Normalization: Emails and phones are discovered from HTML and
+   visible text, validated and normalized, and attributed to source URLs.
+5) Breach Checks: Emails are looked up via a HaveIBeenPwned proxy; phone numbers
+   via LeakCheck.
+6) Reporting: Results are summarized and saved to JSON, CSV, or Markdown.
 
-  HIBP_API_KEY      - HaveIBeenPwned API key
-  LEAKCHECK_API_KEY - LeakCheck API key (optional, for phone checks)
-  CRAWL_DEPTH       - Maximum crawl depth (default 3)
+Configuration
+-------------
+Settings are loaded from ``config.json`` if present, otherwise from environment
+variables. Recognized keys/env vars:
 
-Create `config.json` in the same directory with keys hibp_api_key, leakcheck_api_key,
-and crawl_depth to avoid setting environment variables each run.
+- ``hibp_api_key`` / ``HIBP_API_KEY``: HIBP proxy API key
+- ``leakcheck_api_key`` / ``LEAKCHECK_API_KEY``: LeakCheck API key
+- ``crawl_depth`` / ``CRAWL_DEPTH``: Maximum crawl depth
 
-Command line options:
-  -d, --depth         Maximum crawl depth
-  -v, --verbose       Enable debug logging
-  -j, --json          Save results as DOMAIN-TIMESTAMP.json
-  --csv               Save results as DOMAIN-TIMESTAMP.csv
-  --md, --report      Save results as DOMAIN-TIMESTAMP.md
-  -c, --concurrency   Number of concurrent workers
+CLI Usage
+---------
+    python3 break_checker.py [options] domain
+
+Options:
+- ``-d``, ``--depth``: Maximum crawl depth
+- ``-v``, ``--verbose``: Enable debug logging
+- ``-j``, ``--json``: Save results as DOMAIN-TIMESTAMP.json (default)
+- ``--csv``: Save results as DOMAIN-TIMESTAMP.csv
+- ``--md``, ``--report``: Save results as DOMAIN-TIMESTAMP.md
+- ``-c``, ``--concurrency``: Number of concurrent workers
 """
 
 import os
@@ -56,8 +75,6 @@ import socket
 import errno
 import ssl
 import tldextract
-import threading
-import psutil
 import html
 import unicodedata
 
@@ -66,7 +83,16 @@ import unicodedata
 
 
 def configure_logging(level: int = logging.INFO) -> logging.Logger:
-    """Configure root logging and return module logger with .log backups."""
+    """Configure logging sinks and return this module's logger.
+
+    Args:
+        level: The log level for the root logger (e.g., ``logging.INFO``).
+
+    Returns:
+        A logger scoped to this module. Logs are written to stdout/stderr and
+        to a rotating file ``break_checker.log`` (configurable via
+        ``BREACH_LOG_FILE``).
+    """
     log_file = os.environ.get("BREACH_LOG_FILE", "break_checker.log")
     root_logger = logging.getLogger()
 
@@ -123,61 +149,18 @@ def configure_logging(level: int = logging.INFO) -> logging.Logger:
 logger = configure_logging()
 
 
-# ---------------------- Resource monitoring (CPU & Memory) ----------------------
-
-def _resource_monitor(samples, stop_event: threading.Event, interval: float = 1.0):
-    """
-    Background sampler for per-process CPU% and RSS memory (MB).
-    """
-    proc = psutil.Process()
-    # Prime cpu_percent for first meaningful reading
-    proc.cpu_percent(interval=None)
-    while not stop_event.is_set():
-        try:
-            samples["cpu"].append(proc.cpu_percent(interval=None))  # %
-            samples["mem"].append(proc.memory_info().rss / (1024 * 1024))  # MB
-        except Exception:
-            pass
-        stop_event.wait(interval)
-
-
-def _start_resource_monitor():
-    """
-    Start sampling and return (stop_event, thread, samples_dict).
-    """
-    samples = {"cpu": [], "mem": []}
-    stop_event = threading.Event()
-    t = threading.Thread(target=_resource_monitor,
-                         args=(samples, stop_event), daemon=True)
-    t.start()
-    return stop_event, t, samples
-
-
-def _stop_resource_monitor(stop_event: threading.Event, t: threading.Thread, samples):
-    """
-    Stop sampling and compute aggregate metrics.
-    """
-    stop_event.set()
-    t.join(timeout=2.0)
-    cpu = samples["cpu"]
-    mem = samples["mem"]
-    cpu_avg = (sum(cpu) / len(cpu)) if cpu else 0.0
-    cpu_peak = max(cpu) if cpu else 0.0
-    mem_avg = (sum(mem) / len(mem)) if mem else 0.0
-    mem_peak = max(mem) if mem else 0.0
-    return {
-        "cpu_avg": round(cpu_avg, 2),
-        "cpu_peak": round(cpu_peak, 2),
-        "mem_avg_mb": round(mem_avg, 2),
-        "mem_peak_mb": round(mem_peak, 2),
-    }
+ 
 
 
 # ---------------------- Config & domain validation ----------------------
 
 
 def load_config() -> dict:
-    """Load optional API keys and settings from config.json."""
+    """Load optional API keys and settings from ``config.json``.
+
+    Returns:
+        A dictionary like ``{"hibp_api_key": str|None, "leakcheck_api_key": str|None, "crawl_depth": int}``.
+    """
     config = {"hibp_api_key": None,
               "leakcheck_api_key": None, "crawl_depth": 3}
     try:
@@ -192,7 +175,18 @@ def load_config() -> dict:
 
 
 def validate_domain(user_input: str, *, check_dns: bool = True) -> Tuple[bool, str, str]:
-    """Validate and sanitize a domain provided by a user."""
+    """Validate and sanitize a domain suitable for scanning.
+
+    Args:
+        user_input: Raw domain or URL-like string (``example.com`` or ``https://example.com``).
+        check_dns: When ``True``, require the hostname to resolve via DNS.
+
+    Returns:
+        Tuple ``(ok, domain_ascii, message)`` where:
+        - ``ok`` is ``True`` when the domain is valid (and resolvable if requested).
+        - ``domain_ascii`` contains the ASCII/IDNA domain without scheme, port, or www.
+        - ``message`` is a human-readable validation message.
+    """
     if not user_input or not user_input.strip():
         return False, "", "No domain provided"
 
@@ -242,7 +236,19 @@ def validate_domain(user_input: str, *, check_dns: bool = True) -> Tuple[bool, s
 
 
 def enumerate_subdomains(domain: str) -> Set[str]:
-    """Enumerate subdomains via subfinder or free sources. Wildcards are sanitized."""
+    """Enumerate likely subdomains for a domain.
+
+    Notes:
+    - Prefer the local ``subfinder`` binary if available (fast, comprehensive).
+    - Fallbacks: crt.sh, HackerTarget, and Anubis DB.
+    - Wildcard entries like ``*.example.com`` are de-wildcarded and deduplicated.
+
+    Args:
+        domain: Apex domain to enumerate (e.g., ``example.com``).
+
+    Returns:
+        Set of lower-cased hostnames including the apex domain.
+    """
     subs = set()
 
     if shutil.which("subfinder"):
@@ -316,6 +322,20 @@ def enumerate_subdomains(domain: str) -> Set[str]:
 
 
 async def _probe_once(session: aiohttp.ClientSession, method: str, url: str) -> bool:
+    """Perform a single HTTP probe and report liveness.
+
+    Sends one request with the given method to the URL using the provided
+    ``aiohttp`` session. Any HTTP response with status < 400 is considered
+    alive; network/protocol errors are treated as not alive.
+
+    Args:
+        session: Shared ``aiohttp`` client session.
+        method: HTTP method to send (e.g., ``"HEAD"``, ``"GET"``).
+        url: Absolute URL to request.
+
+    Returns:
+        True if a response is received with status < 400; otherwise False.
+    """
     try:
         async with session.request(method, url, allow_redirects=True) as resp:
             # Only <400 counts as alive; 403/405/503 are treated as dead
@@ -326,7 +346,21 @@ async def _probe_once(session: aiohttp.ClientSession, method: str, url: str) -> 
 
 
 async def choose_scheme(session: aiohttp.ClientSession, host: str, *, retries: int = 2, per_try_delay: float = 0.35) -> Optional[str]:
-    """Return reachable scheme ('https' or 'http') using IPv4-only connector with retries."""
+    """Probe which scheme is reachable for a host.
+
+    Tries ``https`` first, then ``http``. Uses an IPv4-only connector and
+    performs a cheap ``HEAD`` followed by a ``GET`` if needed. Retries include
+    a small backoff delay.
+
+    Args:
+        session: Shared aiohttp session.
+        host: Hostname without scheme or path.
+        retries: Additional attempts per scheme.
+        per_try_delay: Base delay applied between attempts (seconds).
+
+    Returns:
+        "https" or "http" if the host responds (<400), otherwise None.
+    """
     for scheme in ("https", "http"):
         base = f"{scheme}://{host}"
         for attempt in range(retries + 1):
@@ -340,9 +374,18 @@ async def choose_scheme(session: aiohttp.ClientSession, host: str, *, retries: i
 
 
 async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int = 5, retries: int = 2) -> Dict[str, str]:
-    """Return mapping of reachable subdomains to their scheme using asynchronous probes."""
+    """Filter discovered subdomains down to those with a live web endpoint.
+
+    Args:
+        subdomains: Candidate hostnames to probe.
+        concurrency: Maximum concurrent probes.
+        retries: Attempts per scheme in the chooser.
+
+    Returns:
+        Mapping of ``{host: scheme}`` for hosts that responded successfully.
+    """
     live: Dict[str, str] = {}
-    timeout = aiohttp.ClientTimeout(total=10)  # was 6
+    timeout = aiohttp.ClientTimeout(total=10)
     connector = aiohttp.TCPConnector(
         limit=concurrency, family=socket.AF_INET, ttl_dns_cache=120)
     hosts = sorted(list(subdomains))  # stabilize order
@@ -364,7 +407,7 @@ async def filter_accessible_subdomains(subdomains: Set[str], *, concurrency: int
 
 # ---------------------- Fetching (download-skip + Playwright fallback) ----------------------
 
-# Extensions and path keywords that are very likely non-HTML downloads
+# Global: non-HTML file extensions to skip during crawling
 NON_HTML_EXTS = {
     "pdf", "zip", "gz", "bz2", "xz", "7z", "rar", "exe", "msi", "dmg", "iso",
     "png", "jpg", "jpeg", "gif", "svg", "bmp", "webp", "ico",
@@ -373,6 +416,7 @@ NON_HTML_EXTS = {
     "doc", "docx", "xls", "xlsx", "ppt", "pptx",
 }
 
+# Global: path substrings indicating likely file downloads
 SKIP_PATH_KEYWORDS = (
     "/download/", "/downloads/", "/file/", "/files/", "/attachment/",
     "/attachments/", "/export/", "/exports/", "/wp-content/uploads/",
@@ -381,6 +425,15 @@ SKIP_PATH_KEYWORDS = (
 
 
 def should_skip_url_by_path(url: str) -> bool:
+    """Determine if a URL likely targets a non-HTML asset.
+
+    Args:
+        url: Absolute or relative URL string.
+
+    Returns:
+        True if the path contains download-like segments or a known
+        non-HTML file extension; otherwise False.
+    """
     parsed = urlparse(url)
     path = parsed.path.lower()
     if any(k in path for k in SKIP_PATH_KEYWORDS):
@@ -392,6 +445,15 @@ def should_skip_url_by_path(url: str) -> bool:
 
 
 def is_probably_html(content_type: str) -> bool:
+    """Check whether an HTTP Content-Type denotes HTML.
+
+    Args:
+        content_type: The value of the ``Content-Type`` header.
+
+    Returns:
+        True for ``text/html`` or ``application/xhtml+xml`` (ignoring charset);
+        otherwise False.
+    """
     if not content_type:
         return False
     ct = content_type.lower().split(";")[0].strip()
@@ -404,7 +466,7 @@ async def get_stable_content(
     total_ms: int = 18000,
     idle_ms: int = 1500,
     hydrate_ms: int = 250,
-    min_text_len: int = 80,   # heuristic: don't accept skeleton DOMs
+    min_text_len: int = 80, 
 ) -> str | None:
     """
     Return 'good enough' HTML:
@@ -412,6 +474,16 @@ async def get_stable_content(
       2) Brief hydration wait (React/Vue) → try again.
       3) One-time network-idle wait (SPA data fetch) → try again.
     All within a hard deadline. Returns None if the page never stabilizes.
+    
+    Args:
+        page: Playwright page object to read from.
+        total_ms: Total time budget in milliseconds.
+        idle_ms: Timeout for ``networkidle`` wait in milliseconds.
+        hydrate_ms: Short hydration pause in milliseconds before re-checking.
+        min_text_len: Threshold for considering the page "good enough".
+
+    Returns:
+        HTML string if stabilization succeeded within the deadline; otherwise ``None``.
     """
     deadline = time.monotonic() + total_ms / 1000.0
 
@@ -470,6 +542,16 @@ async def get_stable_content(
 
 
 async def http_fallback(context, url: str, timeout: int = 60000) -> Optional[str]:
+    """Fetch text via Playwright's context HTTP client.
+
+    Args:
+        context: A Playwright browser context.
+        url: Absolute URL to fetch.
+        timeout: Request timeout in milliseconds.
+
+    Returns:
+        Response body text if the request succeeds; otherwise ``None``.
+    """
     try:
         r = await context.request.get(url, timeout=timeout)
         if r.ok:
@@ -479,11 +561,23 @@ async def http_fallback(context, url: str, timeout: int = 60000) -> Optional[str
     return None
 
 
+# Hosts that repeatedly refuse or fail connections are marked as dead to avoid
+# wasting time re-trying them during a single run.
 _DEAD_HOSTS: set[str] = set()
+# Track per-host failure counts that trigger dead-host marking.
 _DEAD_HOST_FAILS: Dict[str, int] = defaultdict(int)
 
 
 def _classify_net_error(exc: Exception) -> str:
+    """Summarize a network/client error into a compact label for logging.
+
+    Args:
+        exc: The raised exception from a network operation.
+
+    Returns:
+        A short label such as "refused", "dns", "tls", "timeout",
+        "connect", or "other".
+    """
     if isinstance(exc, aiohttp.ClientConnectorError):
         os_err = getattr(exc, "os_error", None)
         if isinstance(os_err, OSError):
@@ -511,14 +605,21 @@ def _classify_net_error(exc: Exception) -> str:
 
 
 # ---------- Persistent Playwright (single global context) ----------
-
+# Shared Playwright engine objects, initialized on demand and reused across pages:
+# - _PW: Playwright runtime instance
+# - _PW_BROWSER: headless Chromium browser
+# - _PW_CTX: shared browser context (assets like images/media/fonts are blocked)
 _PW = None
 _PW_BROWSER = None
 _PW_CTX = None
 
 
 async def _ensure_pw_started():
-    """Start Playwright once and create a shared global context."""
+    """Start Playwright once and create a shared global context.
+
+    Returns:
+        None. Initializes module-level ``_PW``, ``_PW_BROWSER``, and ``_PW_CTX``.
+    """
     global _PW, _PW_BROWSER, _PW_CTX
     if _PW is not None:
         return
@@ -539,7 +640,11 @@ async def _ensure_pw_started():
 
 
 async def _shutdown_pw():
-    """Cleanly close the shared Playwright resources (if started)."""
+    """Cleanly close the shared Playwright resources if they were started.
+
+    Returns:
+        None. Resets the module-level Playwright globals to ``None``.
+    """
     global _PW, _PW_BROWSER, _PW_CTX
     try:
         if _PW_CTX is not None:
@@ -562,9 +667,15 @@ async def _shutdown_pw():
 
 
 async def _render_with_pw(url: str) -> Optional[str]:
-    """
-    Render a URL using the shared Playwright browser/context.
-    Includes a single self-heal retry if the browser died under load.
+    """Render a URL using the shared Playwright browser/context.
+
+    Includes one self-heal retry if the browser died under load.
+
+    Args:
+        url: Absolute URL to render.
+
+    Returns:
+        HTML string when rendering succeeds; otherwise ``None``.
     """
     await _ensure_pw_started()
     assert _PW_CTX is not None
@@ -628,15 +739,21 @@ async def _render_with_pw(url: str) -> Optional[str]:
 
     return None
 
-
 async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
-    """
+    """Fetch page text, rendering HTML with Playwright when appropriate.
     Policy:
       - If it's clearly a download → skip.
       - If it's clearly text but NOT HTML → fetch with aiohttp and return text.
       - If it's (likely) HTML → ALWAYS render with Playwright.
       - If HEAD lies or is missing → do ONE GET to sniff headers/body,
         but DO NOT return HTML from aiohttp; escalate to Playwright instead.
+
+    Args:
+        session: Shared aiohttp client session.
+        url: Absolute URL to fetch.
+
+    Returns:
+        Text content if fetched or rendered successfully; otherwise ``None``.
     """
     try:
         # 0) Cheap path/extension skip
@@ -725,6 +842,7 @@ async def fetch_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
 
 # ---------------------- URL canonicalization helpers ----------------------
 
+# Global: query parameters treated as tracking/analytics and removed
 TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "utm_id", "utm_reader", "utm_name", "utm_place", "utm_creative",
@@ -735,6 +853,14 @@ TRACKING_PREFIXES = ("utm_", "_hs", "vero_")
 
 
 def _should_drop_param(k: str) -> bool:
+    """Check if a query parameter is tracking/analytics-related.
+
+    Args:
+        k: Query parameter name.
+
+    Returns:
+        True if the parameter should be removed as tracking/analytics; otherwise False.
+    """
     k_low = k.lower()
     if k_low in TRACKING_PARAMS:
         return True
@@ -742,6 +868,17 @@ def _should_drop_param(k: str) -> bool:
 
 
 def _normalize_path(path: str) -> str:
+    """Normalize a URL path for canonicalization.
+
+    - Collapse multiple slashes into a single slash (``//`` → ``/``)
+    - Remove trailing slash except when the path is just ``/``
+
+    Args:
+        path: Raw path component to normalize.
+
+    Returns:
+        Normalized path suitable for canonical URL construction.
+    """
     # Collapse multiple slashes, keep a single leading slash
     path = re.sub(r"/{2,}", "/", path)
     # Remove trailing slash except root
@@ -751,10 +888,20 @@ def _normalize_path(path: str) -> str:
 
 
 def canonicalize_url(base_url: str, link: str, *, scope_host: str) -> Optional[str]:
-    """
-    Resolve link to absolute URL, strip fragments, normalize host/path,
-    remove tracking query params, sort remaining query params.
-    Only return URLs within scope_host.
+    """Resolve and normalize an in-scope link to a canonical absolute URL.
+
+    Steps:
+    - Resolve against ``base_url`` and drop URL fragment.
+    - Enforce ``http/https`` schemes and scope by hostname.
+    - Normalize path and clean/sort query parameters, dropping trackers.
+
+    Args:
+        base_url: The page URL the link was found on.
+        link: The raw link/href value.
+        scope_host: Hostname suffix that defines in-scope URLs.
+
+    Returns:
+        Canonical absolute URL string when in scope; otherwise ``None``.
     """
     if not link:
         return None
@@ -766,7 +913,7 @@ def canonicalize_url(base_url: str, link: str, *, scope_host: str) -> Optional[s
     # Guard against malformed IPv6/bad hrefs raising ValueError
     try:
         abs_url = urljoin(base_url, link)
-        abs_url, _frag = urldefrag(abs_url)
+        abs_url, _ = urldefrag(abs_url)
         parsed = urlparse(abs_url)
     except Exception:
         return None
@@ -781,9 +928,7 @@ def canonicalize_url(base_url: str, link: str, *, scope_host: str) -> Optional[s
 
     # Normalize path
     path = parsed.path or "/"
-    path = re.sub(r"/{2,}", "/", path)
-    if len(path) > 1 and path.endswith("/"):
-        path = path[:-1]
+    path = _normalize_path(path)
 
     # Clean query: drop tracking, sort remaining, dedupe
     query = ""
@@ -809,10 +954,14 @@ def canonicalize_url(base_url: str, link: str, *, scope_host: str) -> Optional[s
 
 
 def _url_struct_key(u: str) -> Tuple[str, str, Tuple[Tuple[str, str], ...]]:
-    """
-    Return a canonical structural key for dedup:
-      (host, normalized_path_without_html_or_trailing_slash, first N sorted query pairs)
-    so /a/b, /a/b/, and /a/b.html collapse, but distinct query variants don't.
+    """Compute a structural URL key for robust de-duplication.
+
+    Args:
+        u: Absolute URL string.
+
+    Returns:
+        Tuple of ``(host, normalized_path_without_html_or_trailing_slash,
+        first_5_sorted_query_pairs)`` used to collapse near-duplicates.
     """
     p = urlparse(u)
     host = (p.hostname or "").lower()
@@ -825,19 +974,23 @@ def _url_struct_key(u: str) -> Tuple[str, str, Tuple[Tuple[str, str], ...]]:
 
 # ---------------------- Extraction helpers ----------------------
 
+# Global: TLDs/extensions that should NOT appear as email TLDs in regex
 EMAIL_IGNORE_EXTS = (
     "png", "jpg", "jpeg", "gif", "svg", "bmp", "webp", "ico",
     "css", "js", "json", "xml", "csv", "txt", "pdf",
     "doc", "docx", "xls", "xlsx",
 )
 
+# Global: email extraction regex (excludes common file extensions as TLDs)
 EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?!(?:" +
     "|".join(EMAIL_IGNORE_EXTS) + r")\b)[a-zA-Z]{2,}"
 )
 
+# Global: phone extraction regex (tolerant digits and separators)
 PHONE_RE = re.compile(r"\+?\d[\d\s()\-]{6,}\d")
 
+# Global: mapping from TLD to default phone region code
 _TLD_TO_REGION: Dict[str, str] = {
     "gr": "GR", "us": "US", "uk": "GB", "gb": "GB", "de": "DE", "fr": "FR", "it": "IT", "es": "ES", "pt": "PT", "nl": "NL",
     "be": "BE", "se": "SE", "no": "NO", "fi": "FI", "dk": "DK", "pl": "PL", "cz": "CZ", "sk": "SK", "hu": "HU", "ro": "RO",
@@ -848,11 +1001,27 @@ _TLD_TO_REGION: Dict[str, str] = {
 
 
 def _guess_region_from_domain(domain: str) -> Optional[str]:
+    """Infer a default phone region from a domain's TLD.
+
+    Args:
+        domain: Target domain (e.g., ``example.gr``).
+
+    Returns:
+        ISO 3166-1 alpha-2 country code (e.g., ``"GR"``) or ``None``.
+    """
     tld = domain.rsplit(".", 1)[-1].lower()
     return _TLD_TO_REGION.get(tld)
 
 
 def _clean_angle_brackets(s: str) -> str:
+    """Trim surrounding angle brackets if present.
+
+    Args:
+        s: Input string possibly wrapped in ``<`` and ``>``.
+
+    Returns:
+        The inner string without surrounding brackets; otherwise the original.
+    """
     s = s.strip()
     if s.startswith("<") and s.endswith(">"):
         return s[1:-1]
@@ -861,21 +1030,31 @@ def _clean_angle_brackets(s: str) -> str:
 # ---- New: targeted text/email normalization helpers ----
 
 def _decode_backslash_escapes(s: str) -> str:
-    """
-    Decode only \\uXXXX and \\xNN sequences (like \\u003c, \\x3c) commonly found
-    in JSON/script blobs. Leaves other escapes (\\n, \\t, \\\\) untouched.
+    """Decode selective backslash escapes common in script blobs.
+
+    Args:
+        s: Raw string possibly containing ``\\uXXXX`` or ``\\xNN`` sequences.
+
+    Returns:
+        String with Unicode/hex escapes decoded; other escapes are preserved.
     """
     s = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), s)
     s = re.sub(r"\\x([0-9a-fA-F]{2})",  lambda m: chr(int(m.group(1), 16)), s)
     return s
 
 
+# Global: regex to trim leading/trailing wrapper punctuation (e.g., <...>, "...")
 _PUNCT_EDGES = re.compile(r"^\s*([<\[\(\{\"']*)(.*?)([>\]\)\}\"']*)\s*$")
 
 
 def _strip_edge_punct(s: str) -> str:
-    """
-    Strip wrapper punctuation like <...>, "..." from the ends only.
+    """Strip wrapper punctuation from the string edges only.
+
+    Args:
+        s: Input string possibly wrapped by punctuation (e.g., ``<...>``, ``"..."``).
+
+    Returns:
+        The inner string without leading/trailing wrapper punctuation.
     """
     m = _PUNCT_EDGES.match(s)
     if not m:
@@ -885,11 +1064,18 @@ def _strip_edge_punct(s: str) -> str:
 
 
 def _norm_text(s: str) -> str:
-    """
-    Normalize page text safely:
-      1) Unescape HTML entities (&lt; &#x3c; etc.)
-      2) Decode explicit \\uXXXX/\\xNN sequences
-      3) Normalize Unicode and drop zero-width/control chars (keep whitespace)
+    """Normalize text derived from HTML or script content.
+
+    Steps:
+    - Unescape HTML entities (e.g., ``&lt;``, ``&#x3c;``)
+    - Decode ``\\uXXXX``/``\\xNN`` sequences
+    - Apply Unicode normalization (NFKC) and drop control chars except whitespace
+
+    Args:
+        s: Raw text to normalize.
+
+    Returns:
+        A cleaned, normalized string suitable for regex extraction.
     """
     s = html.unescape(s)
     s = _decode_backslash_escapes(s)
@@ -901,7 +1087,15 @@ def _norm_text(s: str) -> str:
 
 
 def normalize_email(email: str) -> Optional[str]:
-    """Validate and normalize an email; canonical form is lower-case for dedup."""
+    """Validate and normalize an email address.
+
+    Args:
+        email: Raw email candidate as found on a page.
+
+    Returns:
+        Lower-cased, validated address suitable for de-duplication; or ``None``
+        if invalid.
+    """
     candidate = _strip_edge_punct(_norm_text(unquote(email.strip())))
     try:
         valid = validate_email(candidate.lower(), check_deliverability=True)
@@ -912,9 +1106,14 @@ def normalize_email(email: str) -> Optional[str]:
 
 
 def normalize_phone(phone: str, default_region: Optional[str] = None) -> Optional[str]:
-    """
-    Return phone in national digits-only if valid (>=7 digits). Tries E.164 and region fallback.
-    (Stricter original logic to reduce false positives.)
+    """Normalize a phone number to digits-only national format when valid.
+
+    Args:
+        phone: Raw phone string as found on a page.
+        default_region: Preferred region when parsing non-E.164 numbers.
+
+    Returns:
+        Digits-only national number (length >= 7) if valid; otherwise ``None``.
     """
     raw = phone.strip()
     try_order: List[Optional[str]] = [default_region,
@@ -936,12 +1135,18 @@ def normalize_phone(phone: str, default_region: Optional[str] = None) -> Optiona
 
 
 def _extract_mailto_addresses(href: str) -> List[str]:
-    """
-    Extract one or more email addresses from a mailto: URL.
-    Handles forms like:
-      mailto:user@example.com
-      mailto://user@example.com
-      mailto:?to=user@example.com&cc=a@b.com;b@c.com
+    """Extract one or more email addresses from a ``mailto:`` URL.
+
+    Supports forms like:
+    - ``mailto:user@example.com``
+    - ``mailto://user@example.com``
+    - ``mailto:?to=user@example.com&cc=a@b.com;b@c.com``
+
+    Args:
+        href: Raw ``mailto:`` link value.
+
+    Returns:
+        List of extracted addresses (unvalidated). May be empty.
     """
     out: List[str] = []
     try:
@@ -966,9 +1171,15 @@ def _extract_mailto_addresses(href: str) -> List[str]:
 
 
 def _extract_tel_numbers(href: str) -> List[str]:
-    """
-    Extract a phone string from tel: URL.
-    Handles tel:+123..., tel://+123..., and strips query.
+    """Extract phone candidates from a ``tel:`` URL.
+
+    Supports ``tel:+123...`` and ``tel://+123...`` and strips any query.
+
+    Args:
+        href: Raw ``tel:`` link value.
+
+    Returns:
+        List with one candidate phone string (unvalidated) or empty list.
     """
     out: List[str] = []
     try:
@@ -989,9 +1200,22 @@ def _extract_tel_numbers(href: str) -> List[str]:
 
 
 class Crawler:
-    """Asynchronous breadth-first crawler limited to the target domain."""
+    """Asynchronous breadth-first crawler limited to the target domain.
+
+    Responsibilities:
+    - Maintain in-scope URL queue and structural de-duplication.
+    - Fetch and render pages, then extract and normalize contacts.
+    - Track discovery sources and basic acceptance/drop metrics.
+    """
 
     def __init__(self, domain: str, max_depth: int = 3, concurrency: int = 5):
+        """Initialize a domain-scoped crawler.
+
+        Args:
+            domain: Target domain (apex) to constrain crawling.
+            max_depth: Maximum link/script depth from each start URL.
+            concurrency: Number of concurrent fetch/process tasks.
+        """
         self.domain = domain
         self.max_depth = max_depth
         self.concurrency = concurrency
@@ -1021,7 +1245,13 @@ class Crawler:
         )
 
     def add_email(self, email: str, source: str, snippet: str = "") -> None:
-        """Store email (org-scope filtered) and log discovery once unless verbose."""
+        """Validate, org-scope filter, and store an email with its source.
+
+        Args:
+            email: Raw email candidate.
+            source: URL where the email was discovered.
+            snippet: Optional nearby text for debug logging.
+        """
         canon = normalize_email(email)
         if not canon:
             return
@@ -1059,6 +1289,16 @@ class Crawler:
                          " ".join(snippet.strip().split()))
 
     def add_phone(self, phone: str, source: str, snippet: str = "") -> None:
+        """Validate and store a phone number with its discovery source.
+
+        The normalized representation is digits-only (national format). Invalid
+        candidates are dropped to minimize false positives.
+
+        Args:
+            phone: Raw phone candidate.
+            source: URL where the phone was discovered.
+            snippet: Optional nearby text for debug logging.
+        """
         norm = normalize_phone(phone, self.default_region)
         if norm:
             is_new = norm not in self.phones
@@ -1077,11 +1317,15 @@ class Crawler:
             self._phones_dropped += 1
 
     async def crawl(self, start_url: str):
-        """Breadth-first crawl starting from the supplied URL."""
+        """Breadth-first crawl starting from the supplied URL.
+
+        Args:
+            start_url: Seed URL to begin crawling for this domain.
+        """
         logger.debug("Starting the inner crawler at %s", start_url)
         queue = deque([(start_url, 0)])
         self._queued.add(start_url)
-        timeout = aiohttp.ClientTimeout(total=45)  # was 30
+        timeout = aiohttp.ClientTimeout(total=45)
         connector = aiohttp.TCPConnector(
             limit=self.concurrency, family=socket.AF_INET, ttl_dns_cache=120
         )
@@ -1106,6 +1350,14 @@ class Crawler:
                     await asyncio.gather(*tasks, return_exceptions=False)
 
     async def _process_url(self, session: aiohttp.ClientSession, url: str, depth: int, queue: deque):
+        """Fetch, extract, and enqueue new links/scripts from a single URL.
+
+        Args:
+            session: Shared ``aiohttp`` session for this crawl.
+            url: Absolute URL to process.
+            depth: Current crawl depth.
+            queue: BFS queue to extend with discovered items.
+        """
         logger.debug("Crawling %s (depth: %d)", url, depth)
         try:
             content = await asyncio.wait_for(fetch_url(session, url), timeout=70)
@@ -1169,6 +1421,13 @@ class Crawler:
                 logger.debug("Discovered script %s", cand)
 
     def extract_data(self, text: str, url: str, *, allow_phones: bool = True):
+        """Extract normalized emails and phone numbers from page text.
+
+        Args:
+            text: Raw or rendered page text.
+            url: Source URL for attribution/logging.
+            allow_phones: When False, only extract emails (e.g., from JS files).
+        """
         before_emails = len(self.emails)
         before_phones = len(self.phones)
 
@@ -1197,7 +1456,16 @@ class Crawler:
 
 
 def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
-    """Return list of breaches for an email using a HaveIBeenPwned proxy API."""
+    """Look up email breaches via a HaveIBeenPwned proxy API.
+
+    Args:
+        email: Email address to query.
+        api_key: API key for the HIBP proxy.
+
+    Returns:
+        List of breach names, an empty list if not found, or ``None`` on
+        error/rate limit.
+    """
     if not api_key:
         return None
 
@@ -1231,11 +1499,21 @@ def check_hibp(email: str, api_key: Optional[str]) -> Optional[List[str]]:
     return None
 
 
+# Global: local request timestamps for LeakCheck rate limiting
 _leakcheck_recent = deque()
 
 
 def check_leakcheck_phone(phone: str, api_key: Optional[str]) -> Optional[List[str]]:
-    """Return breach sources for a phone number using the LeakCheck v2 API."""
+    """Look up phone breaches via the LeakCheck v2 API.
+
+    Args:
+        phone: Digits-only national phone number.
+        api_key: LeakCheck API key.
+
+    Returns:
+        List of breach source names, an empty list if not found, or ``None`` on
+        error/rate limit.
+    """
     if not api_key:
         return None
 
@@ -1295,7 +1573,17 @@ def save_results(
     fmt: str = "json",
     output_path: str | None = None,
 ) -> str:
-    """Persist scan results to disk and return the file path."""
+    """Serialize and persist scan results.
+
+    Args:
+        results: Dictionary returned by :func:`scan_domain`.
+        domain: The scanned domain (used in default filename).
+        fmt: One of ``"json"``, ``"csv"``, or ``"md"``.
+        output_path: Optional explicit output filename.
+
+    Returns:
+        The path to the created file.
+    """
 
     email_sources = results.get("email_sources", {})
     phone_sources = results.get("phone_sources", {})
@@ -1322,8 +1610,6 @@ def save_results(
     ]
     phones.sort(key=lambda x: x["phone"])
 
-    metrics = results.get("metrics", {})  # may be missing if monitor disabled
-
     summary = {
         "num_subdomains": len(results.get("subdomains", [])),
         "num_endpoints": results.get("num_endpoints", 0),
@@ -1333,10 +1619,6 @@ def save_results(
         "num_breached_phones": len(breached_phones),
         "emails_dropped": results.get("emails_dropped", 0),
         "phones_dropped": results.get("phones_dropped", 0),
-        "cpu_avg_percent": metrics.get("cpu_avg"),
-        "cpu_peak_percent": metrics.get("cpu_peak"),
-        "mem_avg_mb": metrics.get("mem_avg_mb"),
-        "mem_peak_mb": metrics.get("mem_peak_mb"),
     }
 
     report = {
@@ -1355,8 +1637,6 @@ def save_results(
         datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
     if not output_path:
         output_path = f"{base}-{timestamp}.{fmt}"
-
-    logger.info("Saving results to %s...", output_path)
     if fmt == "json":
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
@@ -1427,11 +1707,27 @@ async def scan_domain(
     *,
     verbose: bool = False,
     concurrency: int = 5,
+    save: bool = False,
+    fmt: str = "json",
+    output_path: Optional[str] = None,
 ) -> dict:
-    """Crawl a domain and optionally check contacts against breach data."""
-    # ---- start resource monitor ----
-    mon_stop, mon_thread, mon_samples = _start_resource_monitor()
+    """Crawl a domain and optionally check contacts against breach data.
 
+    Args:
+        domain: Validated target domain (ASCII/IDNA normalized).
+        depth: Maximum crawl depth.
+        hibp_key: API key for HaveIBeenPwned proxy.
+        leakcheck_key: API key for LeakCheck.
+        verbose: Enable debug logging for more detail.
+        concurrency: Number of concurrent workers for fetching/crawling.
+        save: When True, persist results via :func:`save_results`.
+        fmt: Output format for saving ("json", "csv", or "md").
+        output_path: Optional explicit output file path.
+
+    Returns:
+        Dictionary with subdomains, emails, phones, breach mappings,
+        per-item sources, and scan timing/summary.
+    """
     start_time = time.time()
     start_dt = datetime.datetime.now(datetime.timezone.utc)
     logger.info("Starting scan for %s (depth: %d, concurrency: %d)",
@@ -1498,8 +1794,6 @@ async def scan_domain(
     # ---- stop Playwright after all work is done ----
     await _shutdown_pw()
 
-    # ---- stop resource monitor & compute metrics ----
-    metrics = _stop_resource_monitor(mon_stop, mon_thread, mon_samples)
 
     results = {
         "subdomains": set(subdomain_schemes.keys()),
@@ -1512,7 +1806,6 @@ async def scan_domain(
         "num_endpoints": len(crawler.visited),
         "emails_dropped": getattr(crawler, "_emails_dropped", 0),
         "phones_dropped": getattr(crawler, "_phones_dropped", 0),
-        "metrics": metrics,
     }
 
     end_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -1521,6 +1814,32 @@ async def scan_domain(
     ts_format = "%Y-%m-%d %H:%M:%S %Z"
     results["scan_start"] = start_dt.strftime(ts_format)
     results["scan_end"] = end_dt.strftime(ts_format)
+
+    # Unified final summary log for both CLI and API callers
+    logger.info("%s", "=" * 60)
+    logger.info("Scan Complete for %s in %.2f seconds.",
+                domain, results.get("scan_duration", 0.0))
+    logger.info("Scan started at %s and ended at %s",
+                results.get("scan_start"), results.get("scan_end"))
+    logger.info(
+        "Summary: Crawled %d endpoints, %d subdomains, %d emails (%d breached, %d dropped) and %d phones (%d breached, %d dropped).",
+        results.get("num_endpoints", 0),
+        len(results.get("subdomains", [])),
+        len(results.get("emails", [])),
+        len(results.get("breached_emails", {})),
+        results.get("emails_dropped", 0),
+        len(results.get("phones", [])),
+        len(results.get("breached_phones", {})),
+        results.get("phones_dropped", 0),
+    )
+    if save:
+        try:
+            saved_to = save_results(results, domain, fmt=fmt, output_path=output_path)
+            logger.info("Saved results to %s", saved_to)
+        except Exception as exc:
+            logger.warning("Failed to save results: %s", exc)
+    logger.info("%s", "=" * 60)
+
     return results
 
 
@@ -1528,6 +1847,14 @@ async def scan_domain(
 
 
 def parse_args(default_depth: int) -> argparse.Namespace:
+    """Define and parse CLI arguments for the scanner.
+
+    Args:
+        default_depth: Fallback value for ``--depth``.
+
+    Returns:
+        An ``argparse.Namespace`` with parsed options.
+    """
     parser = argparse.ArgumentParser(
         description="Crawl a domain and check contacts against breach data")
     parser.add_argument("domain", help="Target domain to scan")
@@ -1550,6 +1877,14 @@ def parse_args(default_depth: int) -> argparse.Namespace:
 
 
 async def main() -> dict:
+    """Entry point for CLI execution.
+
+    Loads configuration, validates the input domain, orchestrates the scan, and
+    writes the selected report format.
+
+    Returns:
+        Raw results dictionary with contacts, breaches, and metadata.
+    """
     cfg = load_config()
     default_depth = int(os.environ.get(
         "CRAWL_DEPTH", cfg.get("crawl_depth", 3)))
@@ -1568,15 +1903,6 @@ async def main() -> dict:
     leak_key = os.environ.get(
         "LEAKCHECK_API_KEY") or cfg.get("leakcheck_api_key")
 
-    results = await scan_domain(
-        domain_norm,
-        args.depth,
-        hibp_key,
-        leak_key,
-        verbose=args.verbose,
-        concurrency=args.concurrency,
-    )
-
     if args.csv:
         fmt = "csv"
     elif args.md:
@@ -1584,25 +1910,17 @@ async def main() -> dict:
     else:
         fmt = "json"
 
-    save_results(results, domain_norm, fmt=fmt, output_path=args.output)
-
-    logging.info("%s", "=" * 60)
-    logging.info("Scan Complete for %s in %.2f seconds.",
-                 domain_norm, results.get("scan_duration", 0.0))
-    logging.info("Scan started at %s and ended at %s",
-                 results.get("scan_start"), results.get("scan_end"))
-    logging.info(
-        "Summary: Crawled %d endpoints, %d subdomains, %d emails (%d breached, %d dropped) and %d phones (%d breached, %d dropped).",
-        results.get("num_endpoints", 0),
-        len(results["subdomains"]),
-        len(results["emails"]),
-        len(results["breached_emails"]),
-        results.get("emails_dropped", 0),
-        len(results["phones"]),
-        len(results.get("breached_phones", {})),
-        results.get("phones_dropped", 0),
+    results = await scan_domain(
+        domain_norm,
+        args.depth,
+        hibp_key,
+        leak_key,
+        verbose=args.verbose,
+        concurrency=args.concurrency,
+        save=True,
+        fmt=fmt,
+        output_path=args.output,
     )
-    logging.info("%s", "=" * 60)
     return results
 
 

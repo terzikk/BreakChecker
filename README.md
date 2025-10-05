@@ -27,9 +27,7 @@ adds detailed logs about every step.
 
 Watch a short demonstration of BreakChecker’s API scanning and reporting process:
 
-<video src="assets/BreakChecker-Recording.mp4" controls="controls" width="800" muted>
-Your browser does not support the video tag.
-</video>
+[![Watch the API demo](assets/breakchecker_api_demo_thumbnail.png)](assets/BreakChecker-Recording.mp4)
 
 
 ## Installation

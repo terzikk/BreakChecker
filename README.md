@@ -27,7 +27,7 @@ adds detailed logs about every step.
 
 Interested in seeing BreakChecker in action? Click the image below to watch a short demo of the API being used:
 
-[![Watch the API demo](assets/breakchecker_api_demo_thumbnail.png)](assets/BreakChecker%20Recording.mp4)
+[![Watch the API demo](assets/BreakChecker%20Recording.mp4)
 
 ## Installation
 

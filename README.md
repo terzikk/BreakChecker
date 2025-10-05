@@ -72,7 +72,6 @@ python break_checker.py example.com -d 2 -c 5 -v --json
 
 Each argument configures how the scan is performed:
 
-- `domain` â€“ the domain to crawl and check
 -  `domain` — the domain to crawl and check 
 -  `-d`, `--depth` — maximum crawl depth (default taken from `CRAWL_DEPTH` or 3) 
 -  `-c`, `--concurrency` — number of concurrent workers (default 5) 

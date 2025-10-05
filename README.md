@@ -25,9 +25,11 @@ adds detailed logs about every step.
 
 ## API Demo
 
-Watch a short demonstration of BreakChecker’s API scanning and reporting process:
+Watch a short demonstration of BreakChecker's API scanning and reporting process on YouTube:
 
-[![Watch the API demo](assets/breakchecker_api_demo_thumbnail.png)](assets/BreakChecker-Recording.mp4)
+[![Watch the API demo](assets/breakchecker_api_demo_thumbnail.png)](https://youtu.be/NEy9i1OLTOo?si=X7u3unWurzspuL0r)
+
+[Watch on YouTube](https://youtu.be/NEy9i1OLTOo?si=X7u3unWurzspuL0r)
 
 
 ## Installation
@@ -47,7 +49,6 @@ for the CLI.
 The crawler reads its settings from environment variables or an optional
 `config.json` file:
 
-- `HIBP_API_KEY` â€“ key for the HaveIBeenPwned proxy.
 -  `HIBP_API_KEY` — key for the HaveIBeenPwned proxy. 
 -  `LEAKCHECK_API_KEY` — key for phone lookups with LeakCheck. 
 -  `CRAWL_DEPTH` — maximum crawl depth (default `3`). 

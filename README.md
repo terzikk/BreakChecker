@@ -23,6 +23,12 @@ The scanner runs in several distinct stages:
 The collected data can be written to JSON, CSV or Markdown reports. Verbose mode
 adds detailed logs about every step.
 
+## API Demo
+
+Interested in seeing BreakChecker in action? Click the image below to watch a short demo of the API being used:
+
+[![Watch the API demo](assets/breakchecker_api_demo_thumbnail.png)](assets/BreakChecker%20Recording.mp4)
+
 ## Installation
 
 Install the pinned Python requirements:
@@ -190,3 +196,4 @@ docker-compose up --build
 ```
 
 The API will be available on <http://localhost:8000/>.
+
